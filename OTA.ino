@@ -11,7 +11,6 @@ String readEEPROM(int startAddress, int endAddress);
 #include <string>
 #include <EEPROM.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <Update.h>
 #include <base64.h>
 #include <SPI.h>
@@ -64,14 +63,11 @@ const char *filePath = "/CCMS/Meter_Readings.txt";
 // Initialize SPI for SD Card
 SPIClass spi2(HSPI);  //SD Card
 
-/*Version URL*/
-const char *version_url = "https://raw.githubusercontent.com/Mahesh-rss/OTA_Repo/main/version.txt";
-/*Firmware URL*/
-const char *firmware_url = "https://raw.githubusercontent.com/Mahesh-rss/OTA_Repo/main/build/esp32.esp32.esp32s3/firmware.ino.bin";
-const char *server = "124.40.247.18";              // Your Spring Boot server
-const char *versionResource = "/dblayer/version";  // Version check endpoint
-const char *firmwareResource = "/dblayer/ota";     // Firmware update endpoint
-const int port = 214;                              // Your server port
+/* GitHub OTA */
+const char *githubHost = "raw.githubusercontent.com";
+const int githubPort = 443;
+const char *githubVersionResource = "/Mahesh-rss/OTA_Repo/main/version.txt";
+const char *githubFirmwareResource = "/Mahesh-rss/OTA_Repo/main/OTA.ino.bin";
 
 String MAC_ID;
 
@@ -156,7 +152,7 @@ float VA_TOTAL_ = 0.0;
 long count = 0;
 
 /*Current firmware version*/
-const String currentVersion = "2.6";
+const String currentVersion = "2.7";
 
 unsigned long previouslyPublishedMillis = 0;
 unsigned long readingsPublishingInterval = 10;
@@ -211,8 +207,8 @@ TinyGsm modem(SerialAT);
 #endif
 
 TinyGsmClient client(modem);
+TinyGsmClientSecure otaClient(modem);
 PubSubClient mqtt(client);
-HttpClient http(client, server, port);
 
 String readBuffer;
 String doorStatus = "Open";
@@ -2455,207 +2451,153 @@ String readEEPROM(int startAddress, int endAddress) {
   return data;
 }
 
-// Check for update by comparing versions
-bool checkForUpdate() {
-  Serial.println("Start");
-  HTTPClient http;
-  http.begin(version_url);
-  // http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);  // Enable following redirects
-  int httpCode = http.GET();
-  if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND) {
-    String newLocation = http.header("Location");
-    Serial.println("Redirected to: " + newLocation);
-    http.end();
-    http.begin(newLocation);  // Follow the new URL
-    httpCode = http.GET();
-  }
-  Serial.println("httpCode: " + String(httpCode));
-  if (httpCode == HTTP_CODE_OK) {
-    String latestVersion = http.getString();
-    latestVersion.trim();  // Remove whitespace or newline characters
-    Serial.println("Latest Version: " + latestVersion);
-    Serial.println("Current Version: " + currentVersion);
-    return (latestVersion != currentVersion);
-  } else {
-    Serial.println("Failed to check for updates. HTTP Code: " + String(httpCode));
-    return false;
-  }
-}
-
-// Perform OTA update
-void performOTA() {
-  HTTPClient http;
-  http.begin(firmware_url);
-  // http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);  // Enable following redirects
-  int httpCode = http.GET();
-  if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND) {
-    String newLocation = http.header("Location");
-    Serial.println("Redirected to: " + newLocation);
-    http.end();
-    http.begin(newLocation);  // Follow the new URL
-    httpCode = http.GET();
-  }
-  if (httpCode == HTTP_CODE_OK) {
-    int contentLength = http.getSize();
-    bool canBegin = Update.begin(contentLength);
-
-    if (canBegin) {
-      Serial.println("Starting OTA...");
-      WiFiClient &client = http.getStream();
-      size_t written = Update.writeStream(client);
-
-      if (written == contentLength && Update.end()) {
-        Serial.println("OTA Update Success. Restarting...");
-        ESP.restart();
-      } else {
-        Serial.println("OTA Update Failed. Error #: " + String(Update.getError()));
-      }
-    } else {
-      Serial.println("Not enough space for OTA update.");
-    }
-  } else {
-    Serial.println("Failed to fetch firmware. HTTP Code: " + String(httpCode));
-  }
-
-  http.end();
-}
-
-// Check version from server
+// Check GitHub version and perform OTA update
 void checkVersion() {
-  Serial.println("\nChecking for updates...");
+  Serial.println("\nChecking GitHub for updates...");
   Serial.print("Current Version: ");
   Serial.println(currentVersion);
 
-  Serial.print("URL: http://");
-  Serial.print(server);
-  Serial.println(versionResource);
+  HttpClient githubHttp(otaClient, githubHost, githubPort);
+  githubHttp.setHttpResponseTimeout(30000);
+  githubHttp.connectionKeepAlive();
 
-  http.beginRequest();
-  http.get(versionResource);
-  http.endRequest();
+  int err = githubHttp.get(githubVersionResource);
 
-  int statusCode = http.responseStatusCode();
-  Serial.print("Status code: ");
+  if (err != 0) {
+    Serial.print("GitHub connection failed: ");
+    Serial.println(err);
+    githubHttp.stop();
+    return;
+  }
+
+  int statusCode = githubHttp.responseStatusCode();
+
+  Serial.print("GitHub version status: ");
   Serial.println(statusCode);
 
-  if (statusCode == 200) {
-    String latestVersion = "";
-    while (http.available()) {
-      latestVersion = http.readStringUntil('\n');
-      latestVersion.trim();  // Remove any whitespace or newlines
-    }
+  if (statusCode != 200) {
+    Serial.println("Failed to get version from GitHub.");
+    githubHttp.stop();
+    return;
+  }
 
-    Serial.print("Latest Version: ");
-    Serial.println(latestVersion);
+  String latestVersion = githubHttp.responseBody();
+  latestVersion.trim();
 
-    if (latestVersion != currentVersion) {
-      Serial.println("Update available!");
-      performUpdate();  // Start the update process
-    } else {
-      Serial.println("Already running the latest version.");
-    }
+  Serial.print("GitHub Version: ");
+  Serial.println(latestVersion);
+
+  githubHttp.stop();
+
+  if (latestVersion != currentVersion) {
+    Serial.println("Update available!");
+    performUpdate();
   } else {
-    Serial.print("Version check failed with status code: ");
-    Serial.println(statusCode);
-
-    String errorResponse = "";
-    while (http.available()) {
-      errorResponse += http.readString();
-    }
-
-    if (errorResponse.length() > 0) {
-      Serial.println("Error response: ");
-      Serial.println(errorResponse);
-    }
+    Serial.println("Already running the latest version.");
   }
 }
 
-// Perform OTA update
+// Download firmware directly from GitHub and perform OTA update
 void performUpdate() {
-  Serial.println("\nStarting firmware update...");
-  Serial.print("URL: http://");
-  Serial.print(server);
-  Serial.println(firmwareResource);
+  Serial.println("\nStarting firmware update from GitHub...");
 
-  // Set longer timeout for large file download
-  http.setTimeout(30000);  // 30 second timeout
+  HttpClient githubHttp(otaClient, githubHost, githubPort);
+  githubHttp.setHttpResponseTimeout(60000);
+  githubHttp.connectionKeepAlive();
 
-  http.beginRequest();
-  http.get(firmwareResource);
-  http.endRequest();
+  int err = githubHttp.get(githubFirmwareResource);
 
-  int statusCode = http.responseStatusCode();
-  Serial.print("Status code: ");
+  if (err != 0) {
+    Serial.print("GitHub firmware connection failed: ");
+    Serial.println(err);
+    githubHttp.stop();
+    return;
+  }
+
+  int statusCode = githubHttp.responseStatusCode();
+
+  Serial.print("GitHub firmware status: ");
   Serial.println(statusCode);
 
-  if (statusCode == 200) {
-    int contentLength = http.contentLength();
-    Serial.print("Content length: ");
-    Serial.println(contentLength);
+  if (statusCode != 200) {
+    Serial.println("Failed to download firmware from GitHub.");
+    githubHttp.stop();
+    return;
+  }
 
-    if (contentLength <= 0) {
-      Serial.println("Invalid content length");
-      return;
-    }
+  int contentLength = githubHttp.contentLength();
 
-    if (!Update.begin(contentLength)) {
-      Serial.println("Not enough space for update");
-      Serial.println("Update error: " + String(Update.getError()));
-      return;
-    }
+  Serial.print("Firmware size: ");
+  Serial.println(contentLength);
 
-    Serial.println("Starting update...");
+  if (contentLength <= 0) {
+    Serial.println("Invalid firmware size.");
+    githubHttp.stop();
+    return;
+  }
 
-    // Use a larger buffer for faster updates
-    const size_t bufferSize = 1024;  // 1KB buffer
-    uint8_t buffer[bufferSize];
-    size_t written = 0;
-    size_t lastProgress = 0;
+  if (!Update.begin(contentLength)) {
+    Serial.println("Not enough space for OTA update.");
+    Serial.print("Update error: ");
+    Serial.println(Update.getError());
+    githubHttp.stop();
+    return;
+  }
 
-    while (written < contentLength) {
-      // Calculate and show progress
+  Serial.println("Starting OTA download...");
+
+  const size_t bufferSize = 1024;
+  uint8_t buffer[bufferSize];
+  size_t written = 0;
+  int lastProgress = -1;
+
+  while (written < (size_t)contentLength) {
+    size_t bytesToRead = min(bufferSize, (size_t)contentLength - written);
+    size_t bytesRead = githubHttp.readBytes((char *)buffer, bytesToRead);
+
+    if (bytesRead > 0) {
+      size_t bytesWritten = Update.write(buffer, bytesRead);
+
+      if (bytesWritten != bytesRead) {
+        Serial.println("Error writing firmware to flash.");
+        Update.abort();
+        githubHttp.stop();
+        return;
+      }
+
+      written += bytesWritten;
+
       int progress = (written * 100) / contentLength;
+
       if (progress != lastProgress) {
-        Serial.print("Progress: ");
+        Serial.print("OTA Progress: ");
         Serial.print(progress);
         Serial.println("%");
         lastProgress = progress;
       }
-
-      // Read a chunk of data
-      size_t bytesToRead = min(bufferSize, (size_t)(contentLength - written));
-      size_t bytesRead = http.readBytes((char *)buffer, bytesToRead);
-
-      if (bytesRead > 0) {
-        // Write the chunk to update
-        size_t bytesWritten = Update.write(buffer, bytesRead);
-        if (bytesWritten == bytesRead) {
-          written += bytesWritten;
-        } else {
-          Serial.println("Error writing to update");
-          Update.abort();
-          return;
-        }
-      } else {
-        delay(100);  // Wait a bit if no data
-      }
-    }
-
-    if (written == contentLength && Update.end()) {
-      Serial.println("Update successful! Restarting...");
-      ESP.restart();
     } else {
-      Serial.println("Update failed!");
-      Serial.print("Error: ");
-      Serial.println(Update.getError());
-      Serial.print("Written: ");
-      Serial.print(written);
-      Serial.print(" of ");
-      Serial.println(contentLength);
+      Serial.println("Firmware download stopped before completion.");
+      Update.abort();
+      githubHttp.stop();
+      return;
     }
+  }
+
+  githubHttp.stop();
+
+  if (written == (size_t)contentLength && Update.end()) {
+    Serial.println("OTA Update Success.");
+    Serial.println("Restarting ESP32-S3...");
+    delay(2000);
+    ESP.restart();
   } else {
-    Serial.print("Failed to download firmware. Status code: ");
-    Serial.println(statusCode);
+    Serial.println("OTA Update Failed.");
+    Serial.print("Update error: ");
+    Serial.println(Update.getError());
+    Serial.print("Written: ");
+    Serial.print(written);
+    Serial.print(" / ");
+    Serial.println(contentLength);
   }
 }
 
