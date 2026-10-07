@@ -152,7 +152,7 @@ float VA_TOTAL_ = 0.0;
 long count = 0;
 
 /*Current firmware version*/
-const String currentVersion = "2.7";
+const String currentVersion = "2.8";
 
 unsigned long previouslyPublishedMillis = 0;
 unsigned long readingsPublishingInterval = 10;
