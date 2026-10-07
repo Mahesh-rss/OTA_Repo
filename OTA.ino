@@ -67,11 +67,11 @@ SPIClass spi2(HSPI);  //SD Card
 /*Version URL*/
 const char *version_url = "https://raw.githubusercontent.com/Mahesh-rss/OTA_Repo/main/version.txt";
 /*Firmware URL*/
-const char *firmware_url = "https://raw.githubusercontent.com/Mahesh-rss/OTA_Repo/main/OTA.ino.bin";
-const char *server = "localhost";              // Your Spring Boot server
+const char *firmware_url = "https://raw.githubusercontent.com/Mahesh-rss/OTA_Repo/main/build/esp32.esp32.esp32s3/firmware.ino.bin";
+const char *server = "124.40.247.18";              // Your Spring Boot server
 const char *versionResource = "/dblayer/version";  // Version check endpoint
 const char *firmwareResource = "/dblayer/ota";     // Firmware update endpoint
-const int port = 7034;                              // Your server port
+const int port = 214;                              // Your server port
 
 String MAC_ID;
 
@@ -813,8 +813,8 @@ void fetchMqttCreds() {
 bool fetchDeviceType() {
   Serial.println("Fetching Device Type...");
 
-  const char *host = "localhost";
-  const int port = 7034;
+  const char *host = "124.40.247.18";
+  const int port = 214;
   const String macAddress = MAC_ID;
 
   String path = "/dblayer/GetDeviceType/" + macAddress;
