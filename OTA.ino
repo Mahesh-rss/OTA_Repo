@@ -1355,7 +1355,7 @@ void readAndPublishParams() {
     // docu["dateTime"] = dateTime = globalDateTime = getDateTime();
     // docu["dateTime"] = dateTime = globalDateTime = getRTCTimestamp();
     docu["dateTime"] = dateTime = globalDateTime = getCurrentTime();
-    Serial.println("Date time to publish is : ");
+    Serial.println("Date(^~^) time to publish is : ");
     Serial.println(dateTime.c_str());
     const char *dt = dateTime.c_str();
     // docu["Door_Status"] = getDoorState();
@@ -2451,43 +2451,598 @@ String readEEPROM(int startAddress, int endAddress) {
   return data;
 }
 
+// ========================= EC200U NATIVE HTTPS UFS OTA =========================
+
+bool ec200WaitFor(const char *token, uint32_t timeout) {
+  String response;
+  response.reserve(512);
+  uint32_t start = millis();
+
+  while (millis() - start < timeout) {
+    while (SerialAT.available()) {
+      char c = (char)SerialAT.read();
+      response += c;
+
+      if (response.indexOf(token) >= 0) {
+        return true;
+      }
+
+      if (response.length() > 2048) {
+        response.remove(0, 1024);
+      }
+    }
+
+    delay(1);
+  }
+
+  Serial.println("EC200U response timeout");
+  Serial.println(response);
+  return false;
+}
+
+bool ec200SendOK(const String &command, uint32_t timeout = 10000) {
+  while (SerialAT.available()) {
+    SerialAT.read();
+  }
+
+  SerialAT.println(command);
+  return ec200WaitFor("OK", timeout);
+}
+
+bool sendAT(const String &command, const char *expected, uint32_t timeout) {
+  while (SerialAT.available()) {
+    SerialAT.read();
+  }
+
+  SerialAT.println(command);
+  return ec200WaitFor(expected, timeout);
+}
+
+bool readLineFromModem(String &line, unsigned long timeout) {
+  line = "";
+  unsigned long start = millis();
+
+  while (millis() - start < timeout) {
+    while (SerialAT.available()) {
+      char c = (char)SerialAT.read();
+
+      if (c == '\n') {
+        line.trim();
+        return true;
+      }
+
+      if (c != '\r') {
+        line += c;
+      }
+
+      if (line.length() > 128) {
+        line.remove(0, line.length() - 64);
+      }
+    }
+
+    delay(1);
+  }
+
+  return false;
+}
+
+bool ec200WaitForCapture(const char *token, uint32_t timeout, String &response) {
+  response = "";
+  response.reserve(512);
+  uint32_t start = millis();
+  bool tokenFound = false;
+
+  while (millis() - start < timeout) {
+    while (SerialAT.available()) {
+      char c = (char)SerialAT.read();
+      response += c;
+
+      if (!tokenFound && response.indexOf(token) >= 0) {
+        tokenFound = true;
+      }
+
+      if (tokenFound && c == '\n') {
+        return true;
+      }
+
+      if (response.length() > 4096) {
+        response.remove(0, 2048);
+      }
+    }
+
+    delay(1);
+  }
+
+  return false;
+}
+
+bool ec200SetURL(const char *url) {
+  while (SerialAT.available()) {
+    SerialAT.read();
+  }
+
+  SerialAT.print("AT+QHTTPURL=");
+  SerialAT.print(strlen(url));
+  SerialAT.println(",120");
+
+  if (!ec200WaitFor("CONNECT", 10000)) {
+    Serial.println("QHTTPURL CONNECT failed");
+    return false;
+  }
+
+  SerialAT.print(url);
+
+  if (!ec200WaitFor("OK", 10000)) {
+    Serial.println("QHTTPURL failed");
+    return false;
+  }
+
+  return true;
+}
+
+bool configureEC200UHTTPS() {
+  Serial.println("Configuring EC200U HTTPS...");
+
+  if (!ec200SendOK("AT+QHTTPCFG=\"contextid\",1", 5000)) return false;
+  if (!ec200SendOK("AT+QHTTPCFG=\"responseheader\",0", 5000)) return false;
+  if (!ec200SendOK("AT+QHTTPCFG=\"rspout/auto\",0", 5000)) return false;
+  if (!ec200SendOK("AT+QHTTPCFG=\"sslctxid\",1", 5000)) return false;
+
+  if (!ec200SendOK("AT+QSSLCFG=\"sslversion\",1,3", 5000)) return false;
+  if (!ec200SendOK("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF", 5000)) return false;
+  if (!ec200SendOK("AT+QSSLCFG=\"seclevel\",1,0", 5000)) return false;
+  if (!ec200SendOK("AT+QSSLCFG=\"ignorelocaltime\",1,1", 5000)) return false;
+  if (!ec200SendOK("AT+QSSLCFG=\"sni\",1,1", 5000)) return false;
+
+  Serial.println("EC200U HTTPS configuration complete");
+  return true;
+}
+
+bool ec200HTTPGet(const char *url, int &httpCode, size_t &contentLength) {
+  httpCode = 0;
+  contentLength = 0;
+
+  if (!ec200SetURL(url)) {
+    return false;
+  }
+
+  while (SerialAT.available()) {
+    SerialAT.read();
+  }
+
+  Serial.println("Sending QHTTPGET...");
+  SerialAT.println("AT+QHTTPGET=180");
+
+  String response;
+  response.reserve(512);
+  uint32_t start = millis();
+
+  while (millis() - start < 190000UL) {
+    while (SerialAT.available()) {
+      char c = (char)SerialAT.read();
+      response += c;
+
+      int pos = response.indexOf("+QHTTPGET:");
+      if (pos >= 0) {
+        int lineEnd = response.indexOf('\n', pos);
+        if (lineEnd < 0) {
+          lineEnd = response.length();
+        }
+
+        String line = response.substring(pos, lineEnd);
+        line.trim();
+
+        int p1 = line.indexOf(':');
+        int p2 = line.indexOf(',', p1 + 1);
+        int p3 = line.indexOf(',', p2 + 1);
+
+        if (p1 >= 0 && p2 > p1 && p3 > p2) {
+          int err = line.substring(p1 + 1, p2).toInt();
+          httpCode = line.substring(p2 + 1, p3).toInt();
+          contentLength = (size_t)line.substring(p3 + 1).toInt();
+
+          Serial.print("QHTTPGET error: ");
+          Serial.println(err);
+          Serial.print("HTTP status: ");
+          Serial.println(httpCode);
+          Serial.print("Content length: ");
+          Serial.println(contentLength);
+
+          return err == 0 && httpCode == 200 && contentLength > 0;
+        }
+      }
+
+      if (response.indexOf("ERROR") >= 0) {
+        Serial.println("QHTTPGET returned ERROR");
+        Serial.println(response);
+        return false;
+      }
+
+      if (response.length() > 2048) {
+        response.remove(0, 1024);
+      }
+    }
+
+    delay(1);
+  }
+
+  Serial.println("QHTTPGET timeout");
+  Serial.println(response);
+  return false;
+}
+
+bool ec200WaitForConnect(uint32_t timeout) {
+  String response;
+  response.reserve(128);
+  uint32_t start = millis();
+
+  while (millis() - start < timeout) {
+    while (SerialAT.available()) {
+      char c = (char)SerialAT.read();
+      response += c;
+
+      if (response.indexOf("CONNECT") >= 0) {
+        return true;
+      }
+
+      if (response.indexOf("ERROR") >= 0) {
+        Serial.println(response);
+        return false;
+      }
+    }
+
+    delay(1);
+  }
+
+  Serial.println("QHTTPREAD CONNECT timeout");
+  Serial.println(response);
+  return false;
+}
+
+bool ec200ReadVersion(size_t contentLength, String &body) {
+  body = "";
+
+  while (SerialAT.available()) {
+    SerialAT.read();
+  }
+
+  SerialAT.println("AT+QHTTPREAD=120");
+
+  if (!ec200WaitForConnect(10000)) {
+    return false;
+  }
+
+  body.reserve(contentLength + 1);
+
+  size_t received = 0;
+  uint32_t lastData = millis();
+
+  while (received < contentLength) {
+    while (SerialAT.available() && received < contentLength) {
+      body += (char)SerialAT.read();
+      received++;
+      lastData = millis();
+    }
+
+    if (millis() - lastData > 30000UL) {
+      Serial.println("Timeout while reading version response");
+      return false;
+    }
+
+    delay(1);
+  }
+
+  body.trim();
+
+  if (!ec200WaitFor("OK", 10000)) {
+    Serial.println("EC200U did not finish QHTTPREAD cleanly");
+    return false;
+  }
+
+  return received == contentLength;
+}
+
+bool ec200DownloadFirmwareToUFS(size_t contentLength) {
+  Serial.println("Downloading firmware to EC200U UFS...");
+
+  sendAT("AT+QFDEL=\"UFS:ota.bin\"", "OK", 5000);
+
+  String command = "AT+QHTTPREADFILE=\"UFS:ota.bin\",180";
+
+  while (SerialAT.available()) {
+    SerialAT.read();
+  }
+
+  SerialAT.println(command);
+
+  String response;
+
+  if (!ec200WaitForCapture("+QHTTPREADFILE:", 300000, response)) {
+    Serial.println("QHTTPREADFILE timeout");
+    return false;
+  }
+
+  Serial.print("QHTTPREADFILE response: ");
+  Serial.println(response);
+
+  int resultPos = response.indexOf("+QHTTPREADFILE:");
+  if (resultPos < 0) {
+    Serial.println("No QHTTPREADFILE result");
+    return false;
+  }
+
+  String result = response.substring(resultPos);
+  int lineEnd = result.indexOf('\n');
+
+  if (lineEnd >= 0) {
+    result = result.substring(0, lineEnd);
+  }
+
+  result.trim();
+
+  int colon = result.indexOf(':');
+  int errorCode = (colon >= 0) ? result.substring(colon + 1).toInt() : -1;
+
+  if (errorCode != 0) {
+    Serial.print("QHTTPREADFILE failed: ");
+    Serial.println(errorCode);
+    return false;
+  }
+
+  Serial.print("Firmware stored in EC200U UFS: ");
+  Serial.print(contentLength);
+  Serial.println(" bytes");
+
+  return true;
+}
+
+long parseQFReadLength(String line) {
+  line.trim();
+
+  if (line.startsWith("[") && line.endsWith("]")) {
+    line = line.substring(1, line.length() - 1);
+    return line.toInt();
+  }
+
+  int space = line.indexOf(' ');
+  if (space >= 0) {
+    String value = line.substring(space + 1);
+    value.trim();
+    return value.toInt();
+  }
+
+  bool numeric = line.length() > 0;
+
+  for (size_t i = 0; i < line.length(); i++) {
+    if (!isDigit(line[i])) {
+      numeric = false;
+      break;
+    }
+  }
+
+  return numeric ? line.toInt() : -1;
+}
+
+bool readQFReadHeader(long &blockLength, unsigned long timeout) {
+  String line;
+  uint32_t start = millis();
+
+  while (millis() - start < timeout) {
+    if (!readLineFromModem(line, 5000)) {
+      continue;
+    }
+
+    if (line.indexOf("CONNECT") >= 0) {
+      String afterConnect = line.substring(line.indexOf("CONNECT") + 7);
+      afterConnect.trim();
+
+      if (afterConnect.length() > 0) {
+        blockLength = parseQFReadLength(afterConnect);
+        return blockLength > 0;
+      }
+
+      if (!readLineFromModem(line, 5000)) {
+        return false;
+      }
+
+      blockLength = parseQFReadLength(line);
+      return blockLength > 0;
+    }
+  }
+
+  return false;
+}
+
+bool readFirmwareFromUFSAndFlash(size_t firmwareSize) {
+  Serial.println("Starting ESP32 OTA from EC200U UFS...");
+
+  while (SerialAT.available()) {
+    SerialAT.read();
+  }
+
+  SerialAT.print("AT+QFOPEN=\"UFS:ota.bin\",2\r\n");
+
+  String response;
+
+  if (!ec200WaitForCapture("+QFOPEN:", 5000, response)) {
+    Serial.println("QFOPEN failed");
+    return false;
+  }
+
+  int marker = response.indexOf("+QFOPEN:");
+  if (marker < 0) {
+    Serial.println("Invalid QFOPEN response");
+    return false;
+  }
+
+  String handleLine = response.substring(marker + 8);
+  int lineEnd = handleLine.indexOf('\n');
+
+  if (lineEnd >= 0) {
+    handleLine = handleLine.substring(0, lineEnd);
+  }
+
+  handleLine.trim();
+
+  int fileHandle = handleLine.toInt();
+
+  if (fileHandle < 0) {
+    Serial.println("Invalid UFS file handle");
+    return false;
+  }
+
+  Serial.print("UFS file handle: ");
+  Serial.println(fileHandle);
+
+  if (!Update.begin(firmwareSize)) {
+    Serial.print("Update.begin failed. Error: ");
+    Serial.println(Update.getError());
+    sendAT("AT+QFCLOSE=" + String(fileHandle), "OK", 5000);
+    return false;
+  }
+
+  size_t totalWritten = 0;
+  const size_t READ_CHUNK = 4096;
+
+  while (totalWritten < firmwareSize) {
+    size_t requested = min(READ_CHUNK, firmwareSize - totalWritten);
+
+    while (SerialAT.available()) {
+      SerialAT.read();
+    }
+
+    SerialAT.print("AT+QFREAD=");
+    SerialAT.print(fileHandle);
+    SerialAT.print(",");
+    SerialAT.print(requested);
+    SerialAT.print("\r\n");
+
+    long blockLength = 0;
+
+    if (!readQFReadHeader(blockLength, 10000)) {
+      Serial.println("QFREAD framing/header failed");
+      Update.abort();
+      sendAT("AT+QFCLOSE=" + String(fileHandle), "OK", 5000);
+      return false;
+    }
+
+    if (blockLength <= 0 || (size_t)blockLength > requested) {
+      Serial.println("Invalid QFREAD block length");
+      Update.abort();
+      sendAT("AT+QFCLOSE=" + String(fileHandle), "OK", 5000);
+      return false;
+    }
+
+    uint8_t buffer[4096];
+    size_t remaining = (size_t)blockLength;
+    size_t offset = 0;
+    uint32_t lastData = millis();
+
+    while (remaining > 0) {
+      size_t availableNow = SerialAT.available();
+
+      if (availableNow > 0) {
+        size_t toRead = min(remaining, availableNow);
+        size_t got = SerialAT.read(buffer + offset, toRead);
+
+        if (got > 0) {
+          offset += got;
+          remaining -= got;
+          lastData = millis();
+        }
+      } else {
+        if (millis() - lastData > 15000UL) {
+          Serial.println("Timed out receiving firmware data");
+          Update.abort();
+          sendAT("AT+QFCLOSE=" + String(fileHandle), "OK", 5000);
+          return false;
+        }
+
+        delay(1);
+      }
+    }
+
+    size_t written = Update.write(buffer, blockLength);
+
+    if (written != (size_t)blockLength) {
+      Serial.println("Update.write failed");
+      Serial.print("Expected: ");
+      Serial.println(blockLength);
+      Serial.print("Written: ");
+      Serial.println(written);
+
+      Update.abort();
+      sendAT("AT+QFCLOSE=" + String(fileHandle), "OK", 5000);
+      return false;
+    }
+
+    totalWritten += (size_t)blockLength;
+
+    int progress = (int)((totalWritten * 100ULL) / firmwareSize);
+
+    Serial.print("OTA Progress: ");
+    Serial.print(progress);
+    Serial.print("% (");
+    Serial.print(totalWritten);
+    Serial.print("/");
+    Serial.print(firmwareSize);
+    Serial.println(")");
+  }
+
+  sendAT("AT+QFCLOSE=" + String(fileHandle), "OK", 5000);
+
+  if (!Update.end(true)) {
+    Serial.print("Update.end failed. Error: ");
+    Serial.println(Update.getError());
+    return false;
+  }
+
+  if (!Update.isFinished()) {
+    Serial.println("OTA image is incomplete");
+    return false;
+  }
+
+  Serial.println("OTA FLASH SUCCESS");
+  Serial.println("Restarting ESP32-S3...");
+  delay(2000);
+  ESP.restart();
+
+  return true;
+}
+
 // Check GitHub version and perform OTA update
 void checkVersion() {
-  Serial.println("\nChecking GitHub for updates...");
+  Serial.println("\nChecking GitHub for updates using EC200U...");
   Serial.print("Current Version: ");
   Serial.println(currentVersion);
 
-  HttpClient githubHttp(otaClient, githubHost, githubPort);
-  githubHttp.setHttpResponseTimeout(30000);
-  githubHttp.connectionKeepAlive();
-
-  int err = githubHttp.get(githubVersionResource);
-
-  if (err != 0) {
-    Serial.print("GitHub connection failed: ");
-    Serial.println(err);
-    githubHttp.stop();
+  if (!configureEC200UHTTPS()) {
+    Serial.println("EC200U HTTPS configuration failed");
     return;
   }
 
-  int statusCode = githubHttp.responseStatusCode();
+  String versionURL = String("https://") + githubHost + githubVersionResource;
 
-  Serial.print("GitHub version status: ");
-  Serial.println(statusCode);
+  Serial.print("Version URL: ");
+  Serial.println(versionURL);
 
-  if (statusCode != 200) {
-    Serial.println("Failed to get version from GitHub.");
-    githubHttp.stop();
+  int statusCode = 0;
+  size_t contentLength = 0;
+
+  if (!ec200HTTPGet(versionURL.c_str(), statusCode, contentLength)) {
+    Serial.println("Failed to get version.txt from GitHub");
     return;
   }
 
-  String latestVersion = githubHttp.responseBody();
-  latestVersion.trim();
+  String latestVersion;
+
+  if (!ec200ReadVersion(contentLength, latestVersion)) {
+    Serial.println("Failed to read version.txt");
+    return;
+  }
 
   Serial.print("GitHub Version: ");
   Serial.println(latestVersion);
-
-  githubHttp.stop();
 
   if (latestVersion != currentVersion) {
     Serial.println("Update available!");
@@ -2497,107 +3052,34 @@ void checkVersion() {
   }
 }
 
-// Download firmware directly from GitHub and perform OTA update
 void performUpdate() {
-  Serial.println("\nStarting firmware update from GitHub...");
+  Serial.println("\nStarting firmware update from GitHub using EC200U...");
 
-  HttpClient githubHttp(otaClient, githubHost, githubPort);
-  githubHttp.setHttpResponseTimeout(60000);
-  githubHttp.connectionKeepAlive();
+  int statusCode = 0;
+  size_t firmwareSize = 0;
 
-  int err = githubHttp.get(githubFirmwareResource);
+  String firmwareURL = String("https://") + githubHost + githubFirmwareResource;
 
-  if (err != 0) {
-    Serial.print("GitHub firmware connection failed: ");
-    Serial.println(err);
-    githubHttp.stop();
+  Serial.print("Firmware URL: ");
+  Serial.println(firmwareURL);
+
+  if (!ec200HTTPGet(firmwareURL.c_str(), statusCode, firmwareSize)) {
+    Serial.println("Failed to request firmware from GitHub");
     return;
   }
-
-  int statusCode = githubHttp.responseStatusCode();
-
-  Serial.print("GitHub firmware status: ");
-  Serial.println(statusCode);
-
-  if (statusCode != 200) {
-    Serial.println("Failed to download firmware from GitHub.");
-    githubHttp.stop();
-    return;
-  }
-
-  int contentLength = githubHttp.contentLength();
 
   Serial.print("Firmware size: ");
-  Serial.println(contentLength);
+  Serial.println(firmwareSize);
 
-  if (contentLength <= 0) {
-    Serial.println("Invalid firmware size.");
-    githubHttp.stop();
+  if (!ec200DownloadFirmwareToUFS(firmwareSize)) {
+    Serial.println("Firmware download to EC200U UFS failed");
     return;
   }
 
-  if (!Update.begin(contentLength)) {
-    Serial.println("Not enough space for OTA update.");
-    Serial.print("Update error: ");
-    Serial.println(Update.getError());
-    githubHttp.stop();
-    return;
-  }
-
-  Serial.println("Starting OTA download...");
-
-  const size_t bufferSize = 1024;
-  uint8_t buffer[bufferSize];
-  size_t written = 0;
-  int lastProgress = -1;
-
-  while (written < (size_t)contentLength) {
-    size_t bytesToRead = min(bufferSize, (size_t)contentLength - written);
-    size_t bytesRead = githubHttp.readBytes((char *)buffer, bytesToRead);
-
-    if (bytesRead > 0) {
-      size_t bytesWritten = Update.write(buffer, bytesRead);
-
-      if (bytesWritten != bytesRead) {
-        Serial.println("Error writing firmware to flash.");
-        Update.abort();
-        githubHttp.stop();
-        return;
-      }
-
-      written += bytesWritten;
-
-      int progress = (written * 100) / contentLength;
-
-      if (progress != lastProgress) {
-        Serial.print("OTA Progress: ");
-        Serial.print(progress);
-        Serial.println("%");
-        lastProgress = progress;
-      }
-    } else {
-      Serial.println("Firmware download stopped before completion.");
-      Update.abort();
-      githubHttp.stop();
-      return;
-    }
-  }
-
-  githubHttp.stop();
-
-  if (written == (size_t)contentLength && Update.end()) {
-    Serial.println("OTA Update Success.");
-    Serial.println("Restarting ESP32-S3...");
-    delay(2000);
-    ESP.restart();
+  if (readFirmwareFromUFSAndFlash(firmwareSize)) {
+    Serial.println("OTA Update Success");
   } else {
-    Serial.println("OTA Update Failed.");
-    Serial.print("Update error: ");
-    Serial.println(Update.getError());
-    Serial.print("Written: ");
-    Serial.print(written);
-    Serial.print(" / ");
-    Serial.println(contentLength);
+    Serial.println("OTA Update Failed");
   }
 }
 
