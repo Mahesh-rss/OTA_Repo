@@ -1,16 +1,11 @@
 #include <ModbusMaster.h>
-
-// Explicit function prototypes
-void enableGPS();
-String readEEPROM(int startAddress, int endAddress);
-
-
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <vector>
 #include <string>
 #include <EEPROM.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <Update.h>
 #include <base64.h>
 #include <SPI.h>
@@ -46,7 +41,7 @@ String longitude;
 unsigned long baseMillis = 0;
 time_t baseEpoch = 0;
 
-String deviceType = "1P-Basic";
+String deviceType = "3P-Adv";
 
 // SD Card Pin Definitions
 #define SD_CS_PIN 48  // SD Card uses HSPI pins
@@ -63,11 +58,14 @@ const char *filePath = "/CCMS/Meter_Readings.txt";
 // Initialize SPI for SD Card
 SPIClass spi2(HSPI);  //SD Card
 
-/* GitHub OTA */
-const char *githubHost = "raw.githubusercontent.com";
-const int githubPort = 443;
-const char *githubVersionResource = "/Mahesh-rss/OTA_Repo/main/version.txt";
-const char *githubFirmwareResource = "/Mahesh-rss/OTA_Repo/main/OTA.ino.bin";
+/*Version URL*/
+const char *version_url = "https://raw.githubusercontent.com/Mahesh-rss/OTA_Repo/main/version.txt";
+/*Firmware URL*/
+const char *firmware_url = "https://raw.githubusercontent.com/Mahesh-rss/OTA_Repo/main/OTA.ino.bin";
+const char *server = "124.40.247.18";              // Your Spring Boot server
+const char *versionResource = "/dblayer/version";  // Version check endpoint
+const char *firmwareResource = "/dblayer/ota";     // Firmware update endpoint
+const int port = 214;                              // Your server port
 
 String MAC_ID;
 
@@ -112,9 +110,6 @@ float IHR_ = 0.0;
 float IHY_ = 0.0;
 float IHB_ = 0.0;
 
-float PE_ = 0.0;
-float NE_ = 0.0;
-
 float CrestVR_ = 0.0;
 float CrestVY_ = 0.0;
 float CrestVB_ = 0.0;
@@ -152,7 +147,7 @@ float VA_TOTAL_ = 0.0;
 long count = 0;
 
 /*Current firmware version*/
-const String currentVersion = "2.8";
+const String currentVersion = "2.7";
 
 unsigned long previouslyPublishedMillis = 0;
 unsigned long readingsPublishingInterval = 10;
@@ -203,12 +198,12 @@ const char apn[] = "";  //APN automatically detects for 4G SIM IN MOST CASES, IF
 StreamDebugger debugger(SerialAT, Serial);
 TinyGsm modem(debugger);
 #else
-TinyGsm modem(SerialAT);
+TinyGsm modem(SerialAT);//controls and communicates with the ec200
 #endif
 
-TinyGsmClient client(modem);
-TinyGsmClientSecure otaClient(modem);
-PubSubClient mqtt(client);
+TinyGsmClient client(modem); // used to create connection
+PubSubClient mqtt(client);  // 
+HttpClient http(client, server, port);
 
 String readBuffer;
 String doorStatus = "Open";
@@ -333,7 +328,7 @@ void setup() {
   }
 
   check4Gmodule();
-  //enableGPS();
+  enableGPS();
 
   /////////////////////////////
   syncTimeFromSIM();
@@ -351,7 +346,7 @@ void setup() {
   Serial.println(readBuffer);
 
   /* Readings Related */
-  Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  Serial2.begin(38400, SERIAL_8E1, RXD2, TXD2);
   // Serial2.setTimeout(500);  // 500ms timeout - gives PN8700 enough time to respond to all registers
   node.begin(Serial2);
 
@@ -726,14 +721,10 @@ void check4Gmodule() {
   // To skip it, call init() instead of restart()
 
   String name = modem.getModemName();
-  DBG("Modem Name:", name);  // Quectel EC200U
-
+  DBG("Modem Name:", name);
 
   String modemInfo = modem.getModemInfo();
-  DBG("Modem Info:", modemInfo);  // Quectel EC200U Revision: EC200UCNAAR03A03M08
-
-
-
+  DBG("Modem Info:", modemInfo);
 
   Serial.println("Waiting for network...");
   if (!modem.waitForNetwork()) {
@@ -768,7 +759,7 @@ void check4Gmodule() {
     //   Serial.println("Already running the latest firmware.");
     // }
     // Check version if modem is connected
-    checkVersion();
+     checkVersion();
     setRTCFromString(getDateTime());
     // fetchMqttCreds();
     setMqttCredsHost();
@@ -1300,7 +1291,7 @@ String getRTCTimestamp() {
 bool readParamFromMeter(uint16_t paramAddress, float &targetVar) {
   uint16_t answer = 0;
   uint16_t DATA1[10];
-  answer = node.readHoldingRegisters(1, paramAddress, 6);
+  answer = node.readHoldingRegisters(2, paramAddress, 6);
   if (answer == node.ku8MBSuccess) {
     for (int Aj = 0; Aj < 6; Aj++) {
       DATA1[Aj] = node.getResponseBuffer(Aj);
@@ -1396,7 +1387,7 @@ void readAndPublishParams() {
     float IRUW = preferences.getString("IRUW").toFloat();
     float IYUW = preferences.getString("IYUW").toFloat();
     float IBUW = preferences.getString("IBUW").toFloat();
-    //readingsPublishingInterval = preferences.getString("INTERVAL").toInt() * 1000;
+    readingsPublishingInterval = preferences.getString("INTERVAL").toInt() * 1000;
 
     float V1PL = preferences.getString("V1PL").toFloat();
     float V1PU = preferences.getString("V1PU").toFloat();
@@ -1430,22 +1421,310 @@ void readAndPublishParams() {
     // Serial.print("Start -->");
     // getDateTime();
 
-    // =========================================================
-    // JSY-MK-1039 SINGLE-PHASE METER - MODBUS READ
-    // Register 72 = Voltage
-    // Register 73 = Current
-    // Register 74 = Active Power
-    // Registers 75-76 = Forward Energy
-    // Registers 77-78 = Reverse Energy
-    // Register 79 = Power Factor
-    // Register 80 = Frequency
-    // =========================================================
+    clearBuffer();
+    result = node.readHoldingRegisters(2, 100, 70);
+    if (result == node.ku8MBSuccess) {
+
+      // Common parameters of all device types
+      VR_ = getFloatFromBuffer(42);
+      docu["VR"] = String(VR_, 2);
+      IR_ = getFloatFromBuffer(50);
+      docu["IR"] = String(IR_, 2);
+      PF_ = getFloatFromBuffer(16);
+      docu["PF"] = String(PF_, 2);
+      FRQ_ = getFloatFromBuffer(56);
+      docu["FREQ"] = String(FRQ_, 2);
+      WT_ = getFloatFromBuffer(0);
+      docu["WT"] = String(WT_, 2);
+
+      if (deviceType.equals("3P-Basic")) {
+        VY_ = getFloatFromBuffer(44);
+        docu["VY"] = String(VY_, 2);
+        VB_ = getFloatFromBuffer(46);
+        docu["VB"] = String(VB_, 2);
+        VRY_ = getFloatFromBuffer(34);
+        docu["VRY"] = String(VRY_, 2);
+        VYB_ = getFloatFromBuffer(36);
+        docu["VYB"] = String(VYB_, 2);
+        VBR_ = getFloatFromBuffer(38);
+        docu["VBR"] = String(VBR_, 2);
+        IY_ = getFloatFromBuffer(52);
+        docu["IY"] = String(IY_, 2);
+        IB_ = getFloatFromBuffer(54);
+        docu["IB"] = String(IB_, 2);
+        VA_TOTAL_ = getFloatFromBuffer(24);
+        docu["VA_TOTAL"] = String(VA_TOTAL_, 2);
+      }
+
+      if (deviceType.equals("3P-Adv")) {
+        VRY_ = getFloatFromBuffer(34);
+        docu["VRY"] = String(VRY_, 2);
+        VYB_ = getFloatFromBuffer(36);
+        docu["VYB"] = String(VYB_, 2);
+        VBR_ = getFloatFromBuffer(38);
+        docu["VBR"] = String(VBR_, 2);
+        VY_ = getFloatFromBuffer(44);
+        docu["VY"] = String(VY_, 2);
+        VB_ = getFloatFromBuffer(46);
+        docu["VB"] = String(VB_, 2);
+        IY_ = getFloatFromBuffer(52);
+        docu["IY"] = String(IY_, 2);
+        IB_ = getFloatFromBuffer(54);
+        docu["IB"] = String(IB_, 2);
+      }
+
+      // WT_ = getFloatFromBuffer(0);
+      // docu["WT"] = String(WT_, 2);
+      // PF_ = getFloatFromBuffer(16);
+      // docu["PF"] = String(PF_, 2);
+      VLLAVG_ = getFloatFromBuffer(32);
+      // docu["VLL_AVG"] = String(VLLAVG_, 2);
+      // VRY_ = getFloatFromBuffer(34);
+      // docu["VRY"] = String(VRY_, 2);
+      // VYB_ = getFloatFromBuffer(36);
+      // docu["VYB"] = String(VYB_, 2);
+      // VBR_ = getFloatFromBuffer(38);
+      // docu["VBR"] = String(VBR_, 2);
+      VLNAVG_ = getFloatFromBuffer(40);
+      // docu["VLN_AVG"] = String(VLNAVG_, 2);
+      // VR_ = getFloatFromBuffer(42);
+      // docu["VR"] = String(VR_, 2);
+      // VY_ = getFloatFromBuffer(44);
+      // docu["VY"] = String(VY_, 2);
+      // VB_ = getFloatFromBuffer(46);
+      // docu["VB"] = String(VB_, 2);
+      IAVG_ = getFloatFromBuffer(48);
+      // docu["IAVG"] = String(IAVG_, 2);
+      // IR_ = getFloatFromBuffer(50);
+      // docu["IR"] = String(IR_, 2);
+      // IY_ = getFloatFromBuffer(52);
+      // docu["IY"] = String(IY_, 2);
+      // IB_ = getFloatFromBuffer(54);
+      // docu["IB"] = String(IB_, 2);
+      // FRQ_ = getFloatFromBuffer(56);
+      // docu["FREQ"] = String(FRQ_, 2);
+      // docu["WHEB"] = String(getFloatFromBuffer(58), 2);
+      // docu["VAHEB"] = String(getFloatFromBuffer(60), 2);
+      // docu["WHDG"] = String(getFloatFromBuffer(66), 2);
+      // docu["VAHDG"] = String(getFloatFromBuffer(68), 2);
+
+      // float VDR = VLNAVG_ - VR_;
+      // float VDY = VLNAVG_ - VY_;
+      // float VDB = VLNAVG_ - VB_;
+      // docu["VDPR"] = VLNAVG_ == 0.0 ? "0" : String((VDR / VLNAVG_) * 100.0);
+      // docu["VDPY"] = VLNAVG_ == 0.0 ? "0" : String((VDY / VLNAVG_) * 100.0);
+      // docu["VDPB"] = VLNAVG_ == 0.0 ? "0" : String((VDB / VLNAVG_) * 100.0);
+
+      // float VDRY = VLLAVG_ - VRY_;
+      // float VDYB = VLLAVG_ - VYB_;
+      // float VDBR = VLLAVG_ - VBR_;
+      // docu["VDPRY"] = VLLAVG_ == 0.0 ? "0" : String((VDRY / VLLAVG_) * 100.0);
+      // docu["VDPYB"] = VLLAVG_ == 0.0 ? "0" : String((VDYB / VLLAVG_) * 100.0);
+      // docu["VDPBR"] = VLLAVG_ == 0.0 ? "0" : String((VDBR / VLLAVG_) * 100.0);
+
+      // float IDR = IAVG_ - IR_;
+      // float IDY = IAVG_ - IY_;
+      // float IDB = IAVG_ - IB_;
+      // docu["IDPR"] = IAVG_ == 0.0 ? "0" : String((IDR / IAVG_) * 100.0);
+      // docu["IDPY"] = IAVG_ == 0.0 ? "0" : String((IDY / IAVG_) * 100.0);
+      // docu["IDPB"] = IAVG_ == 0.0 ? "0" : String((IDB / IAVG_) * 100.0);
+
+      if (deviceType.equals("3P-Basic")) {
+        docu["VLL_AVG"] = String(VLLAVG_, 2);
+        docu["VLN_AVG"] = String(VLNAVG_, 2);
+        docu["IAVG"] = String(IAVG_, 2);
+
+        float VDPR = getDeviationPercentage(VR_, VLNAVG_);
+        float VDPY = getDeviationPercentage(VY_, VLNAVG_);
+        float VDPB = getDeviationPercentage(VB_, VLNAVG_);
+        docu["MAX_VDP_LN"] = String(getMaxDeviatedPercentage(VDPR, VDPY, VDPB));
+
+        float VDPRY = getDeviationPercentage(VRY_, VLLAVG_);
+        float VDPYB = getDeviationPercentage(VYB_, VLLAVG_);
+        float VDPBR = getDeviationPercentage(VBR_, VLLAVG_);
+        docu["MAX_VDP_LL"] = String(getMaxDeviatedPercentage(VDPRY, VDPYB, VDPBR));
+
+        float IDPR = getDeviationPercentage(IR_, IAVG_);
+        float IDPY = getDeviationPercentage(IY_, IAVG_);
+        float IDPB = getDeviationPercentage(IB_, IAVG_);
+        docu["MAX_VDP_I"] = String(getMaxDeviatedPercentage(IDPR, IDPY, IDPB));
+      }
+
+
+      if (deviceType.equals("3P-Adv")) {
+        float VDPR = getDeviationPercentage(VR_, VLNAVG_);
+        float VDPY = getDeviationPercentage(VY_, VLNAVG_);
+        float VDPB = getDeviationPercentage(VB_, VLNAVG_);
+        docu["MAX_VDP_LN"] = String(getMaxDeviatedPercentage(VDPR, VDPY, VDPB));
+
+        float VDPRY = getDeviationPercentage(VRY_, VLLAVG_);
+        float VDPYB = getDeviationPercentage(VYB_, VLLAVG_);
+        float VDPBR = getDeviationPercentage(VBR_, VLLAVG_);
+        docu["MAX_VDP_LL"] = String(getMaxDeviatedPercentage(VDPRY, VDPYB, VDPBR));
+
+        float IDPR = getDeviationPercentage(IR_, IAVG_);
+        float IDPY = getDeviationPercentage(IY_, IAVG_);
+        float IDPB = getDeviationPercentage(IB_, IAVG_);
+        docu["MAX_VDP_I"] = String(getMaxDeviatedPercentage(IDPR, IDPY, IDPB));
+
+        docu["VLL_AVG"] = String(VLLAVG_, 2);
+        docu["VLN_AVG"] = String(VLNAVG_, 2);
+        docu["IAVG"] = String(IAVG_, 2);
+      }
+
+    } else {
+      Serial.println("Modbus read failed");
+      publishError(String(result), "Modbus Error");
+      return;
+    }
 
     clearBuffer();
+    result = node.readHoldingRegisters(2, 184, 70);
+    if (result == node.ku8MBSuccess) {
 
-   
+      // Common parameters of all device types
+      VHR_ = getFloatFromBuffer(0);
+      docu["VHR"] = String(VHR_, 2);
+      IHR_ = getFloatFromBuffer(6);
+      docu["IHR"] = String(IHR_, 2);
 
+      if (deviceType.equals("3P-Adv") || deviceType.equals("3P-Basic")) {
+        // VHR_ = getFloatFromBuffer(0);
+        // docu["VHR"] = String(VHR_, 2);
+        VHY_ = getFloatFromBuffer(2);
+        docu["VHY"] = String(VHY_, 2);
+        VHB_ = getFloatFromBuffer(4);
+        docu["VHB"] = String(VHB_, 2);
+        // IHR_ = getFloatFromBuffer(6);
+        // docu["IHR"] = String(IHR_, 2);
+        IHY_ = getFloatFromBuffer(8);
+        docu["IHY"] = String(IHY_, 2);
+        IHB_ = getFloatFromBuffer(10);
+        docu["IHB"] = String(IHB_, 2);
+        KVA_MAX_DEM_ = getFloatFromBuffer(26);
+        docu["KVA_MAX_DEM"] = String(KVA_MAX_DEM_, 2);
 
+        // docu["INTERRUPTIONS"] = String(getLongInverseFromBuffer(36));
+      }
+
+    } else {
+      Serial.println("Modbus read failed");
+      publishError(String(result), "Modbus Error");
+      return;
+    }
+
+    clearBuffer();
+    result = node.readHoldingRegisters(2, 242, 70);
+    if (result == node.ku8MBSuccess) {
+      docu["KWHR"] = String(getFloatFromBuffer(0), 2);
+      if (deviceType.equals("3P-Adv") || deviceType.equals("3P-Basic")) {
+        docu["KWHY"] = String(getFloatFromBuffer(2), 2);
+        docu["KWHB"] = String(getFloatFromBuffer(4), 2);
+      }
+    } else {
+      Serial.println("Modbus read failed");
+      publishError(String(result), "Modbus Error");
+      return;
+    }
+
+    if (deviceType.equals("3P-Adv")) {
+      clearBuffer();
+      result = node.readHoldingRegisters(2, 1530, 12);
+      if (result == node.ku8MBSuccess) {
+
+        CrestVR_ = getFloatFromBuffer(0);
+        docu["CrestVR"] = String(CrestVR_, 2);
+        CrestVY_ = getFloatFromBuffer(2);
+        docu["CrestVY"] = String(CrestVY_, 2);
+        CrestVB_ = getFloatFromBuffer(4);
+        docu["CrestVB"] = String(CrestVB_, 2);
+        CrestIR_ = getFloatFromBuffer(6);
+        docu["CrestIR"] = String(CrestIR_, 2);
+        CrestIY_ = getFloatFromBuffer(8);
+        docu["CrestIY"] = String(CrestIY_, 2);
+        CrestIB_ = getFloatFromBuffer(10);
+        docu["CrestIB"] = String(CrestIB_, 2);
+
+        delay(200);
+
+      } else {
+        Serial.println("Modbus read failed");
+        publishError(String(result), "Modbus Error");
+        return;
+      }
+
+      clearBuffer();
+      result = node.readHoldingRegisters(2, 762, 12);
+      if (result == node.ku8MBSuccess) {
+
+        KFactorVR_ = getFloatFromBuffer(0);
+        docu["KFactorVR"] = String(KFactorVR_, 2);
+        KFactorVY_ = getFloatFromBuffer(2);
+        docu["KFactorVY"] = String(KFactorVY_, 2);
+        KFactorVB_ = getFloatFromBuffer(4);
+        docu["KFactorVB"] = String(KFactorVB_, 2);
+        KFactorIR_ = getFloatFromBuffer(6);
+        docu["KFactorIR"] = String(KFactorIR_, 2);
+        KFactorIY_ = getFloatFromBuffer(8);
+        docu["KFactorIY"] = String(KFactorIY_, 2);
+        KFactorIB_ = getFloatFromBuffer(10);
+        docu["KFactorIB"] = String(KFactorIB_, 2);
+
+        delay(200);
+
+      } else {
+        Serial.println("Modbus read failed");
+        publishError(String(result), "Modbus Error");
+        return;
+      }
+
+      clearBuffer();
+      result = node.readHoldingRegisters(2, 798, 60);
+      if (result == node.ku8MBSuccess) {
+
+        HarR3V_ = getFloatFromBuffer(0);
+        docu["HarR3V"] = String(HarR3V_, 2);
+        HarY3V_ = getFloatFromBuffer(2);
+        docu["HarY3V"] = String(HarY3V_, 2);
+        HarB3V_ = getFloatFromBuffer(4);
+        docu["HarB3V"] = String(HarB3V_, 2);
+        HarR3I_ = getFloatFromBuffer(6);
+        docu["HarR3I"] = String(HarR3I_, 2);
+        HarY3I_ = getFloatFromBuffer(8);
+        docu["HarY3I"] = String(HarY3I_, 2);
+        HarB3I_ = getFloatFromBuffer(10);
+        docu["HarB3I"] = String(HarB3I_, 2);
+        HarR5V_ = getFloatFromBuffer(24);
+        docu["HarR5V"] = String(HarR5V_, 2);
+        HarY5V_ = getFloatFromBuffer(26);
+        docu["HarY5V"] = String(HarY5V_, 2);
+        HarB5V_ = getFloatFromBuffer(28);
+        docu["HarB5V"] = String(HarB5V_, 2);
+        HarR5I_ = getFloatFromBuffer(30);
+        docu["HarR5I"] = String(HarR5I_, 2);
+        HarY5I_ = getFloatFromBuffer(32);
+        docu["HarY5I"] = String(HarY5I_, 2);
+        HarB5I_ = getFloatFromBuffer(34);
+        docu["HarB5I"] = String(HarB5I_, 2);
+        HarR7V_ = getFloatFromBuffer(48);
+        docu["HarR7V"] = String(HarR7V_, 2);
+        HarY7V_ = getFloatFromBuffer(50);
+        docu["HarY7V"] = String(HarY7V_, 2);
+        HarB7V_ = getFloatFromBuffer(52);
+        docu["HarB7V"] = String(HarB7V_, 2);
+        HarR7I_ = getFloatFromBuffer(54);
+        docu["HarR7I"] = String(HarR7I_, 2);
+        HarY7I_ = getFloatFromBuffer(56);
+        docu["HarY7I"] = String(HarY7I_, 2);
+        HarB7I_ = getFloatFromBuffer(58);
+        docu["HarB7I"] = String(HarB7I_, 2);
+
+      } else {
+        Serial.println("Modbus read failed");
+        publishError(String(result), "Modbus Error");
+        return;
+      }
+    }
 
     docu["deviceType"] = deviceTypes[deviceType];
 
@@ -1470,7 +1749,6 @@ void readAndPublishParams() {
 
     // if (IAVG_ > 0) {
     if (currentMillis - previouslyPublishedMillis >= readingsPublishingInterval) {
-
       if (mqtt.connected()) {
         /* Publish the data */
 
@@ -2397,7 +2675,7 @@ void initiateEEPROMread() {
     Serial.println("Published Thresholds: " + String(jsonString));
     String thresholdData = String(jsonString);
     if (securedMode) {
-      //thresholdData = initiateEncryption(thresholdData);
+      thresholdData = initiateEncryption(thresholdData);
     }
     if (mqtt.publish("pqm", thresholdData.c_str())) {
       Serial.println("Thresholds published successfully.");
@@ -2451,635 +2729,207 @@ String readEEPROM(int startAddress, int endAddress) {
   return data;
 }
 
-// ========================= EC200U NATIVE HTTPS UFS OTA =========================
-
-bool ec200WaitFor(const char *token, uint32_t timeout) {
-  String response;
-  response.reserve(512);
-  uint32_t start = millis();
-
-  while (millis() - start < timeout) {
-    while (SerialAT.available()) {
-      char c = (char)SerialAT.read();
-      response += c;
-
-      if (response.indexOf(token) >= 0) {
-        return true;
-      }
-
-      if (response.length() > 2048) {
-        response.remove(0, 1024);
-      }
-    }
-
-    delay(1);
+// Check for update by comparing versions
+bool checkForUpdate() {
+  Serial.println("Start");
+  HTTPClient http;
+  http.begin(version_url);
+  // http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);  // Enable following redirects
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND) {
+    String newLocation = http.header("Location");
+    Serial.println("Redirected to: " + newLocation);
+    http.end();
+    http.begin(newLocation);  // Follow the new URL
+    httpCode = http.GET();
   }
-
-  Serial.println("EC200U response timeout");
-  Serial.println(response);
-  return false;
-}
-
-bool ec200SendOK(const String &command, uint32_t timeout = 10000) {
-  while (SerialAT.available()) {
-    SerialAT.read();
-  }
-
-  SerialAT.println(command);
-  return ec200WaitFor("OK", timeout);
-}
-
-bool sendAT(const String &command, const char *expected, uint32_t timeout) {
-  while (SerialAT.available()) {
-    SerialAT.read();
-  }
-
-  SerialAT.println(command);
-  return ec200WaitFor(expected, timeout);
-}
-
-bool readLineFromModem(String &line, unsigned long timeout) {
-  line = "";
-  unsigned long start = millis();
-
-  while (millis() - start < timeout) {
-    while (SerialAT.available()) {
-      char c = (char)SerialAT.read();
-
-      if (c == '\n') {
-        line.trim();
-        return true;
-      }
-
-      if (c != '\r') {
-        line += c;
-      }
-
-      if (line.length() > 128) {
-        line.remove(0, line.length() - 64);
-      }
-    }
-
-    delay(1);
-  }
-
-  return false;
-}
-
-bool ec200WaitForCapture(const char *token, uint32_t timeout, String &response) {
-  response = "";
-  response.reserve(512);
-  uint32_t start = millis();
-  bool tokenFound = false;
-
-  while (millis() - start < timeout) {
-    while (SerialAT.available()) {
-      char c = (char)SerialAT.read();
-      response += c;
-
-      if (!tokenFound && response.indexOf(token) >= 0) {
-        tokenFound = true;
-      }
-
-      if (tokenFound && c == '\n') {
-        return true;
-      }
-
-      if (response.length() > 4096) {
-        response.remove(0, 2048);
-      }
-    }
-
-    delay(1);
-  }
-
-  return false;
-}
-
-bool ec200SetURL(const char *url) {
-  while (SerialAT.available()) {
-    SerialAT.read();
-  }
-
-  SerialAT.print("AT+QHTTPURL=");
-  SerialAT.print(strlen(url));
-  SerialAT.println(",120");
-
-  if (!ec200WaitFor("CONNECT", 10000)) {
-    Serial.println("QHTTPURL CONNECT failed");
+  Serial.println("httpCode: " + String(httpCode));
+  if (httpCode == HTTP_CODE_OK) {
+    String latestVersion = http.getString();
+    latestVersion.trim();  // Remove whitespace or newline characters
+    Serial.println("Latest Version: " + latestVersion);
+    Serial.println("Current Version: " + currentVersion);
+    return (latestVersion != currentVersion);
+  } else {
+    Serial.println("Failed to check for updates. HTTP Code: " + String(httpCode));
     return false;
   }
-
-  SerialAT.print(url);
-
-  if (!ec200WaitFor("OK", 10000)) {
-    Serial.println("QHTTPURL failed");
-    return false;
-  }
-
-  return true;
 }
 
-bool configureEC200UHTTPS() {
-  Serial.println("Configuring EC200U HTTPS...");
-
-  if (!ec200SendOK("AT+QHTTPCFG=\"contextid\",1", 5000)) return false;
-  if (!ec200SendOK("AT+QHTTPCFG=\"responseheader\",0", 5000)) return false;
-  if (!ec200SendOK("AT+QHTTPCFG=\"rspout/auto\",0", 5000)) return false;
-  if (!ec200SendOK("AT+QHTTPCFG=\"sslctxid\",1", 5000)) return false;
-
-  if (!ec200SendOK("AT+QSSLCFG=\"sslversion\",1,3", 5000)) return false;
-  if (!ec200SendOK("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF", 5000)) return false;
-  if (!ec200SendOK("AT+QSSLCFG=\"seclevel\",1,0", 5000)) return false;
-  if (!ec200SendOK("AT+QSSLCFG=\"ignorelocaltime\",1,1", 5000)) return false;
-  if (!ec200SendOK("AT+QSSLCFG=\"sni\",1,1", 5000)) return false;
-
-  Serial.println("EC200U HTTPS configuration complete");
-  return true;
-}
-
-bool ec200HTTPGet(const char *url, int &httpCode, size_t &contentLength) {
-  httpCode = 0;
-  contentLength = 0;
-
-  if (!ec200SetURL(url)) {
-    return false;
+// Perform OTA update
+void performOTA() {
+  HTTPClient http;
+  http.begin(firmware_url);
+  // http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);  // Enable following redirects
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND) {
+    String newLocation = http.header("Location");
+    Serial.println("Redirected to: " + newLocation);
+    http.end();
+    http.begin(newLocation);  // Follow the new URL
+    httpCode = http.GET();
   }
-
-  while (SerialAT.available()) {
-    SerialAT.read();
-  }
-
-  Serial.println("Sending QHTTPGET...");
-  SerialAT.println("AT+QHTTPGET=180");
-
-  String response;
-  response.reserve(512);
-  uint32_t start = millis();
-
-  while (millis() - start < 190000UL) {
-    while (SerialAT.available()) {
-      char c = (char)SerialAT.read();
-      response += c;
-
-      int pos = response.indexOf("+QHTTPGET:");
-      if (pos >= 0) {
-        int lineEnd = response.indexOf('\n', pos);
-        if (lineEnd < 0) {
-          lineEnd = response.length();
-        }
-
-        String line = response.substring(pos, lineEnd);
-        line.trim();
-
-        int p1 = line.indexOf(':');
-        int p2 = line.indexOf(',', p1 + 1);
-        int p3 = line.indexOf(',', p2 + 1);
-
-        if (p1 >= 0 && p2 > p1 && p3 > p2) {
-          int err = line.substring(p1 + 1, p2).toInt();
-          httpCode = line.substring(p2 + 1, p3).toInt();
-          contentLength = (size_t)line.substring(p3 + 1).toInt();
-
-          Serial.print("QHTTPGET error: ");
-          Serial.println(err);
-          Serial.print("HTTP status: ");
-          Serial.println(httpCode);
-          Serial.print("Content length: ");
-          Serial.println(contentLength);
-
-          return err == 0 && httpCode == 200 && contentLength > 0;
-        }
-      }
-
-      if (response.indexOf("ERROR") >= 0) {
-        Serial.println("QHTTPGET returned ERROR");
-        Serial.println(response);
-        return false;
-      }
-
-      if (response.length() > 2048) {
-        response.remove(0, 1024);
-      }
-    }
-
-    delay(1);
-  }
-
-  Serial.println("QHTTPGET timeout");
-  Serial.println(response);
-  return false;
-}
-
-bool ec200WaitForConnect(uint32_t timeout) {
-  String response;
-  response.reserve(128);
-  uint32_t start = millis();
-
-  while (millis() - start < timeout) {
-    while (SerialAT.available()) {
-      char c = (char)SerialAT.read();
-      response += c;
-
-      if (response.indexOf("CONNECT") >= 0) {
-        return true;
-      }
-
-      if (response.indexOf("ERROR") >= 0) {
-        Serial.println(response);
-        return false;
-      }
-    }
-
-    delay(1);
-  }
-
-  Serial.println("QHTTPREAD CONNECT timeout");
-  Serial.println(response);
-  return false;
-}
-
-bool ec200ReadVersion(size_t contentLength, String &body) {
-  body = "";
-
-  while (SerialAT.available()) {
-    SerialAT.read();
-  }
-
-  SerialAT.println("AT+QHTTPREAD=120");
-
-  if (!ec200WaitForConnect(10000)) {
-    return false;
-  }
-
-  body.reserve(contentLength + 1);
-
-  size_t received = 0;
-  uint32_t lastData = millis();
-
-  while (received < contentLength) {
-    while (SerialAT.available() && received < contentLength) {
-      body += (char)SerialAT.read();
-      received++;
-      lastData = millis();
-    }
-
-    if (millis() - lastData > 30000UL) {
-      Serial.println("Timeout while reading version response");
-      return false;
-    }
-
-    delay(1);
-  }
-
-  body.trim();
-
-  if (!ec200WaitFor("OK", 10000)) {
-    Serial.println("EC200U did not finish QHTTPREAD cleanly");
-    return false;
-  }
-
-  return received == contentLength;
-}
-
-bool ec200DownloadFirmwareToUFS(size_t contentLength) {
-  Serial.println("Downloading firmware to EC200U UFS...");
-
-  sendAT("AT+QFDEL=\"UFS:ota.bin\"", "OK", 5000);
-
-  String command = "AT+QHTTPREADFILE=\"UFS:ota.bin\",180";
-
-  while (SerialAT.available()) {
-    SerialAT.read();
-  }
-
-  SerialAT.println(command);
-
-  String response;
-
-  if (!ec200WaitForCapture("+QHTTPREADFILE:", 300000, response)) {
-    Serial.println("QHTTPREADFILE timeout");
-    return false;
-  }
-
-  Serial.print("QHTTPREADFILE response: ");
-  Serial.println(response);
-
-  int resultPos = response.indexOf("+QHTTPREADFILE:");
-  if (resultPos < 0) {
-    Serial.println("No QHTTPREADFILE result");
-    return false;
-  }
-
-  String result = response.substring(resultPos);
-  int lineEnd = result.indexOf('\n');
-
-  if (lineEnd >= 0) {
-    result = result.substring(0, lineEnd);
-  }
-
-  result.trim();
-
-  int colon = result.indexOf(':');
-  int errorCode = (colon >= 0) ? result.substring(colon + 1).toInt() : -1;
-
-  if (errorCode != 0) {
-    Serial.print("QHTTPREADFILE failed: ");
-    Serial.println(errorCode);
-    return false;
-  }
-
-  Serial.print("Firmware stored in EC200U UFS: ");
-  Serial.print(contentLength);
-  Serial.println(" bytes");
-
-  return true;
-}
-
-long parseQFReadLength(String line) {
-  line.trim();
-
-  if (line.startsWith("[") && line.endsWith("]")) {
-    line = line.substring(1, line.length() - 1);
-    return line.toInt();
-  }
-
-  int space = line.indexOf(' ');
-  if (space >= 0) {
-    String value = line.substring(space + 1);
-    value.trim();
-    return value.toInt();
-  }
-
-  bool numeric = line.length() > 0;
-
-  for (size_t i = 0; i < line.length(); i++) {
-    if (!isDigit(line[i])) {
-      numeric = false;
-      break;
-    }
-  }
-
-  return numeric ? line.toInt() : -1;
-}
-
-bool readQFReadHeader(long &blockLength, unsigned long timeout) {
-  String line;
-  uint32_t start = millis();
-
-  while (millis() - start < timeout) {
-    if (!readLineFromModem(line, 5000)) {
-      continue;
-    }
-
-    if (line.indexOf("CONNECT") >= 0) {
-      String afterConnect = line.substring(line.indexOf("CONNECT") + 7);
-      afterConnect.trim();
-
-      if (afterConnect.length() > 0) {
-        blockLength = parseQFReadLength(afterConnect);
-        return blockLength > 0;
-      }
-
-      if (!readLineFromModem(line, 5000)) {
-        return false;
-      }
-
-      blockLength = parseQFReadLength(line);
-      return blockLength > 0;
-    }
-  }
-
-  return false;
-}
-
-bool readFirmwareFromUFSAndFlash(size_t firmwareSize) {
-  Serial.println("Starting ESP32 OTA from EC200U UFS...");
-
-  while (SerialAT.available()) {
-    SerialAT.read();
-  }
-
-  SerialAT.print("AT+QFOPEN=\"UFS:ota.bin\",2\r\n");
-
-  String response;
-
-  if (!ec200WaitForCapture("+QFOPEN:", 5000, response)) {
-    Serial.println("QFOPEN failed");
-    return false;
-  }
-
-  int marker = response.indexOf("+QFOPEN:");
-  if (marker < 0) {
-    Serial.println("Invalid QFOPEN response");
-    return false;
-  }
-
-  String handleLine = response.substring(marker + 8);
-  int lineEnd = handleLine.indexOf('\n');
-
-  if (lineEnd >= 0) {
-    handleLine = handleLine.substring(0, lineEnd);
-  }
-
-  handleLine.trim();
-
-  int fileHandle = handleLine.toInt();
-
-  if (fileHandle < 0) {
-    Serial.println("Invalid UFS file handle");
-    return false;
-  }
-
-  Serial.print("UFS file handle: ");
-  Serial.println(fileHandle);
-
-  if (!Update.begin(firmwareSize)) {
-    Serial.print("Update.begin failed. Error: ");
-    Serial.println(Update.getError());
-    sendAT("AT+QFCLOSE=" + String(fileHandle), "OK", 5000);
-    return false;
-  }
-
-  size_t totalWritten = 0;
-  const size_t READ_CHUNK = 4096;
-
-  while (totalWritten < firmwareSize) {
-    size_t requested = min(READ_CHUNK, firmwareSize - totalWritten);
-
-    while (SerialAT.available()) {
-      SerialAT.read();
-    }
-
-    SerialAT.print("AT+QFREAD=");
-    SerialAT.print(fileHandle);
-    SerialAT.print(",");
-    SerialAT.print(requested);
-    SerialAT.print("\r\n");
-
-    long blockLength = 0;
-
-    if (!readQFReadHeader(blockLength, 10000)) {
-      Serial.println("QFREAD framing/header failed");
-      Update.abort();
-      sendAT("AT+QFCLOSE=" + String(fileHandle), "OK", 5000);
-      return false;
-    }
-
-    if (blockLength <= 0 || (size_t)blockLength > requested) {
-      Serial.println("Invalid QFREAD block length");
-      Update.abort();
-      sendAT("AT+QFCLOSE=" + String(fileHandle), "OK", 5000);
-      return false;
-    }
-
-    uint8_t buffer[4096];
-    size_t remaining = (size_t)blockLength;
-    size_t offset = 0;
-    uint32_t lastData = millis();
-
-    while (remaining > 0) {
-      size_t availableNow = SerialAT.available();
-
-      if (availableNow > 0) {
-        size_t toRead = min(remaining, availableNow);
-        size_t got = SerialAT.read(buffer + offset, toRead);
-
-        if (got > 0) {
-          offset += got;
-          remaining -= got;
-          lastData = millis();
-        }
+  if (httpCode == HTTP_CODE_OK) {
+    int contentLength = http.getSize();
+    bool canBegin = Update.begin(contentLength);
+
+    if (canBegin) {
+      Serial.println("Starting OTA...");
+      WiFiClient &client = http.getStream();
+      size_t written = Update.writeStream(client);
+
+      if (written == contentLength && Update.end()) {
+        Serial.println("OTA Update Success. Restarting...");
+        ESP.restart();
       } else {
-        if (millis() - lastData > 15000UL) {
-          Serial.println("Timed out receiving firmware data");
-          Update.abort();
-          sendAT("AT+QFCLOSE=" + String(fileHandle), "OK", 5000);
-          return false;
-        }
-
-        delay(1);
+        Serial.println("OTA Update Failed. Error #: " + String(Update.getError()));
       }
+    } else {
+      Serial.println("Not enough space for OTA update.");
     }
-
-    size_t written = Update.write(buffer, blockLength);
-
-    if (written != (size_t)blockLength) {
-      Serial.println("Update.write failed");
-      Serial.print("Expected: ");
-      Serial.println(blockLength);
-      Serial.print("Written: ");
-      Serial.println(written);
-
-      Update.abort();
-      sendAT("AT+QFCLOSE=" + String(fileHandle), "OK", 5000);
-      return false;
-    }
-
-    totalWritten += (size_t)blockLength;
-
-    int progress = (int)((totalWritten * 100ULL) / firmwareSize);
-
-    Serial.print("OTA Progress: ");
-    Serial.print(progress);
-    Serial.print("% (");
-    Serial.print(totalWritten);
-    Serial.print("/");
-    Serial.print(firmwareSize);
-    Serial.println(")");
+  } else {
+    Serial.println("Failed to fetch firmware. HTTP Code: " + String(httpCode));
   }
 
-  sendAT("AT+QFCLOSE=" + String(fileHandle), "OK", 5000);
-
-  if (!Update.end(true)) {
-    Serial.print("Update.end failed. Error: ");
-    Serial.println(Update.getError());
-    return false;
-  }
-
-  if (!Update.isFinished()) {
-    Serial.println("OTA image is incomplete");
-    return false;
-  }
-
-  Serial.println("OTA FLASH SUCCESS");
-  Serial.println("Restarting ESP32-S3...");
-  delay(2000);
-  ESP.restart();
-
-  return true;
+  http.end();
 }
 
-// Check GitHub version and perform OTA update
+// Check version from server
 void checkVersion() {
-  Serial.println("\nChecking GitHub for updates using EC200U...");
+  Serial.println("\nChecking for updates...");
   Serial.print("Current Version: ");
   Serial.println(currentVersion);
 
-  if (!configureEC200UHTTPS()) {
-    Serial.println("EC200U HTTPS configuration failed");
-    return;
-  }
+  Serial.print("URL: http://");
+  Serial.print(server);
+  Serial.println(versionResource);
 
-  String versionURL = String("https://") + githubHost + githubVersionResource;
+  http.beginRequest();
+  http.get(versionResource);
+  http.endRequest();
 
-  Serial.print("Version URL: ");
-  Serial.println(versionURL);
+  int statusCode = http.responseStatusCode();
+  Serial.print("Status code: ");
+  Serial.println(statusCode);
 
-  int statusCode = 0;
-  size_t contentLength = 0;
+  if (statusCode == 200) {
+    String latestVersion = "";
+    while (http.available()) {
+      latestVersion = http.readStringUntil('\n');
+      latestVersion.trim();  // Remove any whitespace or newlines
+    }
 
-  if (!ec200HTTPGet(versionURL.c_str(), statusCode, contentLength)) {
-    Serial.println("Failed to get version.txt from GitHub");
-    return;
-  }
+    Serial.print("Latest Version: ");
+    Serial.println(latestVersion);
 
-  String latestVersion;
-
-  if (!ec200ReadVersion(contentLength, latestVersion)) {
-    Serial.println("Failed to read version.txt");
-    return;
-  }
-
-  Serial.print("GitHub Version: ");
-  Serial.println(latestVersion);
-
-  if (latestVersion != currentVersion) {
-    Serial.println("Update available!");
-    performUpdate();
+    if (latestVersion != currentVersion) {
+      Serial.println("Update available!");
+      performUpdate();  // Start the update process
+    } else {
+      Serial.println("Already running the latest version.");
+    }
   } else {
-    Serial.println("Already running the latest version.");
+    Serial.print("Version check failed with status code: ");
+    Serial.println(statusCode);
+
+    String errorResponse = "";
+    while (http.available()) {
+      errorResponse += http.readString();
+    }
+
+    if (errorResponse.length() > 0) {
+      Serial.println("Error response: ");
+      Serial.println(errorResponse);
+    }
   }
 }
 
+// Perform OTA update
 void performUpdate() {
-  Serial.println("\nStarting firmware update from GitHub using EC200U...");
+  Serial.println("\nStarting firmware update...");
+  Serial.print("URL: http://");
+  Serial.print(server);
+  Serial.println(firmwareResource);
 
-  int statusCode = 0;
-  size_t firmwareSize = 0;
+  // Set longer timeout for large file download
+  http.setTimeout(30000);  // 30 second timeout
 
-  String firmwareURL = String("https://") + githubHost + githubFirmwareResource;
+  http.beginRequest();
+  http.get(firmwareResource);
+  http.endRequest();
 
-  Serial.print("Firmware URL: ");
-  Serial.println(firmwareURL);
+  int statusCode = http.responseStatusCode();
+  Serial.print("Status code: ");
+  Serial.println(statusCode);
 
-  if (!ec200HTTPGet(firmwareURL.c_str(), statusCode, firmwareSize)) {
-    Serial.println("Failed to request firmware from GitHub");
-    return;
-  }
+  if (statusCode == 200) {
+    int contentLength = http.contentLength();
+    Serial.print("Content length: ");
+    Serial.println(contentLength);
 
-  Serial.print("Firmware size: ");
-  Serial.println(firmwareSize);
+    if (contentLength <= 0) {
+      Serial.println("Invalid content length");
+      return;
+    }
 
-  if (!ec200DownloadFirmwareToUFS(firmwareSize)) {
-    Serial.println("Firmware download to EC200U UFS failed");
-    return;
-  }
+    if (!Update.begin(contentLength)) {
+      Serial.println("Not enough space for update");
+      Serial.println("Update error: " + String(Update.getError()));
+      return;
+    }
 
-  if (readFirmwareFromUFSAndFlash(firmwareSize)) {
-    Serial.println("OTA Update Success");
+    Serial.println("Starting update...");
+
+    // Use a larger buffer for faster updates
+    const size_t bufferSize = 1024;  // 1KB buffer
+    uint8_t buffer[bufferSize];
+    size_t written = 0;
+    size_t lastProgress = 0;
+
+    while (written < contentLength) {
+      // Calculate and show progress
+      int progress = (written * 100) / contentLength;
+      if (progress != lastProgress) {
+        Serial.print("Progress: ");
+        Serial.print(progress);
+        Serial.println("%");
+        lastProgress = progress;
+      }
+
+      // Read a chunk of data
+      size_t bytesToRead = min(bufferSize, (size_t)(contentLength - written));
+      size_t bytesRead = http.readBytes((char *)buffer, bytesToRead);
+
+      if (bytesRead > 0) {
+        // Write the chunk to update
+        size_t bytesWritten = Update.write(buffer, bytesRead);
+        if (bytesWritten == bytesRead) {
+          written += bytesWritten;
+        } else {
+          Serial.println("Error writing to update");
+          Update.abort();
+          return;
+        }
+      } else {
+        delay(100);  // Wait a bit if no data
+      }
+    }
+
+    if (written == contentLength && Update.end()) {
+      Serial.println("Update successful! Restarting...");
+      ESP.restart();
+    } else {
+      Serial.println("Update failed!");
+      Serial.print("Error: ");
+      Serial.println(Update.getError());
+      Serial.print("Written: ");
+      Serial.print(written);
+      Serial.print(" of ");
+      Serial.println(contentLength);
+    }
   } else {
-    Serial.println("OTA Update Failed");
+    Serial.print("Failed to download firmware. Status code: ");
+    Serial.println(statusCode);
   }
 }
 
