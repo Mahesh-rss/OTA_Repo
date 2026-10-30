@@ -41,7 +41,7 @@ String longitude;
 unsigned long baseMillis = 0;
 time_t baseEpoch = 0;
 
-String deviceType = "3P-Adv";
+String deviceType = "1P-Basic";
 
 // SD Card Pin Definitions
 #define SD_CS_PIN 48  // SD Card uses HSPI pins
@@ -59,9 +59,9 @@ const char *filePath = "/CCMS/Meter_Readings.txt";
 SPIClass spi2(HSPI);  //SD Card
 
 /*Version URL*/
-const char *version_url = "https://raw.githubusercontent.com/Mahesh-rss/OTA_Repo/main/version.txt";
+const char *version_url = "https://raw.githubusercontent.com/NandeepYadav/OTA_Repo/master/version.txt";
 /*Firmware URL*/
-const char *firmware_url = "https://raw.githubusercontent.com/Mahesh-rss/OTA_Repo/main/OTA.ino.bin";
+const char *firmware_url = "https://raw.githubusercontent.com/NandeepYadav/OTA_Repo/master/OTA.ino.bin";
 const char *server = "124.40.247.18";              // Your Spring Boot server
 const char *versionResource = "/dblayer/version";  // Version check endpoint
 const char *firmwareResource = "/dblayer/ota";     // Firmware update endpoint
@@ -198,11 +198,11 @@ const char apn[] = "";  //APN automatically detects for 4G SIM IN MOST CASES, IF
 StreamDebugger debugger(SerialAT, Serial);
 TinyGsm modem(debugger);
 #else
-TinyGsm modem(SerialAT);//controls and communicates with the ec200
+TinyGsm modem(SerialAT);  //controls and communicates with the ec200
 #endif
 
-TinyGsmClient client(modem); // used to create connection
-PubSubClient mqtt(client);  // 
+TinyGsmClient client(modem);  // used to create connection
+PubSubClient mqtt(client);    //
 HttpClient http(client, server, port);
 
 String readBuffer;
@@ -759,7 +759,7 @@ void check4Gmodule() {
     //   Serial.println("Already running the latest firmware.");
     // }
     // Check version if modem is connected
-     checkVersion();
+    checkVersion();
     setRTCFromString(getDateTime());
     // fetchMqttCreds();
     setMqttCredsHost();
@@ -1346,7 +1346,7 @@ void readAndPublishParams() {
     // docu["dateTime"] = dateTime = globalDateTime = getDateTime();
     // docu["dateTime"] = dateTime = globalDateTime = getRTCTimestamp();
     docu["dateTime"] = dateTime = globalDateTime = getCurrentTime();
-    Serial.println("Date(^~^) time to publish is : ");
+    Serial.println("Date <^.^> time to publish is : ");
     Serial.println(dateTime.c_str());
     const char *dt = dateTime.c_str();
     // docu["Door_Status"] = getDoorState();
@@ -2794,6 +2794,25 @@ void performOTA() {
   http.end();
 }
 
+bool isNewerVersion(const String &latest, const String &current) {
+  int latestMajor = 0, latestMinor = 0, latestPatch = 0;
+  int currentMajor = 0, currentMinor = 0, currentPatch = 0;
+
+  int latestParts = sscanf(latest.c_str(), "%d.%d.%d",
+                           &latestMajor, &latestMinor, &latestPatch);
+  int currentParts = sscanf(current.c_str(), "%d.%d.%d",
+                            &currentMajor, &currentMinor, &currentPatch);
+
+  if (latestParts < 2 || currentParts < 2) {
+    Serial.println("Invalid version format. Expected major.minor or major.minor.patch.");
+    return false;
+  }
+
+  if (latestMajor != currentMajor) return latestMajor > currentMajor;
+  if (latestMinor != currentMinor) return latestMinor > currentMinor;
+  return latestPatch > currentPatch;
+}
+
 // Check version from server
 void checkVersion() {
   Serial.println("\nChecking for updates...");
@@ -2803,9 +2822,12 @@ void checkVersion() {
   Serial.print("URL: http://");
   Serial.print(server);
   Serial.println(versionResource);
+  String auth = "max24:max24";
+  String encodedAuth = base64::encode(auth);
 
   http.beginRequest();
   http.get(versionResource);
+  http.sendHeader("Authorization", "Basic " + encodedAuth);
   http.endRequest();
 
   int statusCode = http.responseStatusCode();
@@ -2822,11 +2844,11 @@ void checkVersion() {
     Serial.print("Latest Version: ");
     Serial.println(latestVersion);
 
-    if (latestVersion != currentVersion) {
-      Serial.println("Update available!");
-      performUpdate();  // Start the update process
+    if (isNewerVersion(latestVersion, currentVersion)) {
+      Serial.println("Newer firmware available. Starting OTA...");
+      performUpdate();
     } else {
-      Serial.println("Already running the latest version.");
+      Serial.println("No newer firmware available. OTA skipped.");
     }
   } else {
     Serial.print("Version check failed with status code: ");
@@ -2844,94 +2866,333 @@ void checkVersion() {
   }
 }
 
+bool readOTAHeaders(String &headers) {
+  unsigned long start = millis();
+
+  while (millis() - start < 30000) {
+    while (client.available()) {
+      char c = client.read();
+      headers += c;
+
+      if (headers.endsWith("\r\n\r\n")) {
+        return true;
+      }
+    }
+
+    if (!client.connected() && !client.available()) {
+      break;
+    }
+
+    delay(1);
+  }
+
+  return false;
+}
+
+String getOTAHeader(String headers, String name) {
+  headers.toLowerCase();
+  name.toLowerCase();
+
+  String key = name + ":";
+  int index = headers.indexOf(key);
+
+  if (index < 0) return "";
+
+  int start = index + key.length();
+  int end = headers.indexOf("\r\n", start);
+
+  if (end < 0) return "";
+
+  String value = headers.substring(start, end);
+  value.trim();
+
+  return value;
+}
+
+long getOTAContentLength(String headers) {
+  String value = getOTAHeader(headers, "Content-Length");
+
+  if (value.length() == 0) return -1;
+
+  return value.toInt();
+}
+
 // Perform OTA update
+
 void performUpdate() {
   Serial.println("\nStarting firmware update...");
   Serial.print("URL: http://");
   Serial.print(server);
   Serial.println(firmwareResource);
 
-  // Set longer timeout for large file download
-  http.setTimeout(30000);  // 30 second timeout
+  client.stop();
+  http.stop();
+  delay(1000);
 
-  http.beginRequest();
-  http.get(firmwareResource);
-  http.endRequest();
+  if (!modem.isGprsConnected()) {
+    Serial.println("GPRS disconnected. OTA cancelled.");
+    blinkLED(1);
+    return;
+  }
 
-  int statusCode = http.responseStatusCode();
-  Serial.print("Status code: ");
-  Serial.println(statusCode);
+  String auth = "max24:max24";
+  String encodedAuth = base64::encode(auth);
 
-  if (statusCode == 200) {
-    int contentLength = http.contentLength();
-    Serial.print("Content length: ");
-    Serial.println(contentLength);
+  const size_t bufferSize = 1024;
+  uint8_t buffer[bufferSize];
 
-    if (contentLength <= 0) {
-      Serial.println("Invalid content length");
-      return;
+  size_t written = 0;
+  size_t totalLength = 0;
+
+  bool updateStarted = false;
+
+  int retries = 0;
+  const int maxRetries = 30;
+
+  while (retries < maxRetries) {
+
+    if (updateStarted && written == totalLength) {
+      break;
     }
 
-    if (!Update.begin(contentLength)) {
-      Serial.println("Not enough space for update");
-      Serial.println("Update error: " + String(Update.getError()));
-      return;
-    }
+    client.stop();
+    delay(500);
 
-    Serial.println("Starting update...");
+    if (!modem.isGprsConnected()) {
+      Serial.println("GPRS disconnected. Reconnecting...");
 
-    // Use a larger buffer for faster updates
-    const size_t bufferSize = 1024;  // 1KB buffer
-    uint8_t buffer[bufferSize];
-    size_t written = 0;
-    size_t lastProgress = 0;
-
-    while (written < contentLength) {
-      // Calculate and show progress
-      int progress = (written * 100) / contentLength;
-      if (progress != lastProgress) {
-        Serial.print("Progress: ");
-        Serial.print(progress);
-        Serial.println("%");
-        lastProgress = progress;
-      }
-
-      // Read a chunk of data
-      size_t bytesToRead = min(bufferSize, (size_t)(contentLength - written));
-      size_t bytesRead = http.readBytes((char *)buffer, bytesToRead);
-
-      if (bytesRead > 0) {
-        // Write the chunk to update
-        size_t bytesWritten = Update.write(buffer, bytesRead);
-        if (bytesWritten == bytesRead) {
-          written += bytesWritten;
-        } else {
-          Serial.println("Error writing to update");
-          Update.abort();
-          return;
-        }
-      } else {
-        delay(100);  // Wait a bit if no data
+      if (!modem.gprsConnect(apn)) {
+        retries++;
+        delay(3000);
+        continue;
       }
     }
 
-    if (written == contentLength && Update.end()) {
-      Serial.println("Update successful! Restarting...");
-      ESP.restart();
+    Serial.print("Connecting to OTA server. Resume position: ");
+    Serial.println(written);
+
+    if (!client.connect(server, port)) {
+      Serial.println("TCP connection failed.");
+      retries++;
+      delay(2000);
+      continue;
+    }
+
+    client.print(String("GET ") + firmwareResource + " HTTP/1.1\r\n");
+    client.print(String("Host: ") + server + ":" + String(port) + "\r\n");
+    client.print("Authorization: Basic " + encodedAuth + "\r\n");
+    client.print("Accept-Encoding: identity\r\n");
+
+    if (written > 0) {
+      client.print("Range: bytes=");
+      client.print(written);
+      client.print("-\r\n");
+
+      Serial.print("Requesting remaining bytes from: ");
+      Serial.println(written);
+    }
+
+    client.print("Connection: close\r\n\r\n");
+
+    String headers = "";
+
+    if (!readOTAHeaders(headers)) {
+      Serial.println("HTTP header timeout.");
+      client.stop();
+      retries++;
+      delay(2000);
+      continue;
+    }
+
+    int statusEnd = headers.indexOf('\r');
+
+    if (statusEnd < 0) {
+      Serial.println("Invalid HTTP status line.");
+      client.stop();
+      retries++;
+      delay(2000);
+      continue;
+    }
+
+    String statusLine = headers.substring(0, statusEnd);
+    long responseLength = getOTAContentLength(headers);
+
+    Serial.print("HTTP response: ");
+    Serial.println(statusLine);
+
+    if (!updateStarted) {
+
+      if (statusLine.indexOf(" 200 ") < 0 || responseLength <= 0) {
+        Serial.println("Invalid initial HTTP response.");
+        client.stop();
+        retries++;
+        delay(2000);
+        continue;
+      }
+
+      totalLength = responseLength;
+
+      Serial.print("Firmware size: ");
+      Serial.println(totalLength);
+
+      if (!Update.begin(totalLength)) {
+        Serial.print("Update begin failed: ");
+        Serial.println(Update.getError());
+
+        client.stop();
+        blinkLED(1);
+        return;
+      }
+
+      updateStarted = true;
+      Serial.println("OTA partition initialized.");
+
+    } else if (written == 0) {
+
+      if (statusLine.indexOf(" 200 ") < 0 || responseLength != (long)totalLength) {
+        Serial.println("Invalid initial retry response.");
+        client.stop();
+        retries++;
+        delay(2000);
+        continue;
+      }
+
     } else {
-      Serial.println("Update failed!");
-      Serial.print("Error: ");
-      Serial.println(Update.getError());
-      Serial.print("Written: ");
-      Serial.print(written);
-      Serial.print(" of ");
-      Serial.println(contentLength);
+
+      String contentRange =
+        getOTAHeader(headers, "Content-Range");
+
+      String expectedRange =
+        "bytes " + String(written) + "-" + String(totalLength - 1) + "/" + String(totalLength);
+
+      if (statusLine.indexOf(" 206 ") < 0 || contentRange != expectedRange || responseLength != (long)(totalLength - written)) {
+
+        Serial.println("Invalid partial HTTP response.");
+
+        Serial.print("Received Content-Range: ");
+        Serial.println(contentRange);
+
+        Serial.print("Expected Content-Range: ");
+        Serial.println(expectedRange);
+
+        client.stop();
+        retries++;
+        delay(2000);
+        continue;
+      }
+
+      Serial.println("Resume response verified.");
     }
+
+    unsigned long dataTimer = millis();
+
+    while (written < totalLength) {
+
+      int availableBytes = client.available();
+
+      if (availableBytes > 0) {
+
+        size_t toRead = min(
+          (size_t)availableBytes,
+          min(bufferSize, totalLength - written));
+
+        int bytesRead = client.read(buffer, toRead);
+
+        if (bytesRead > 0) {
+
+          size_t bytesWritten =
+            Update.write(buffer, bytesRead);
+
+          if (bytesWritten != (size_t)bytesRead) {
+            Serial.println("Firmware flash write failed.");
+
+            Serial.print("Update error: ");
+            Serial.println(Update.getError());
+
+            Update.abort();
+            client.stop();
+            blinkLED(1);
+            return;
+          }
+
+          written += bytesWritten;
+          dataTimer = millis();
+
+          int progress = (written * 100) / totalLength;
+
+          Serial.printf(
+            "OTA Progress: %d%% (%u/%u bytes)\n",
+            progress,
+            (unsigned int)written,
+            (unsigned int)totalLength);
+        }
+
+      } else {
+
+        if (!client.connected()) {
+          Serial.println("TCP connection closed. Resume required.");
+          break;
+        }
+
+        if (millis() - dataTimer > 60000) {
+          Serial.println("Download stalled. Resume required.");
+          break;
+        }
+
+        delay(5);
+      }
+    }
+
+    client.stop();
+
+    if (written < totalLength) {
+      retries++;
+
+      Serial.print("Reconnect attempt: ");
+      Serial.print(retries);
+      Serial.print("/");
+      Serial.println(maxRetries);
+
+      delay(2000);
+    }
+  }
+
+  client.stop();
+
+  if (!updateStarted || written != totalLength) {
+    Serial.println("OTA download failed.");
+
+    Serial.print("Received: ");
+    Serial.print(written);
+    Serial.print("/");
+    Serial.println(totalLength);
+
+    if (updateStarted) {
+      Update.abort();
+    }
+
+    blinkLED(1);
+    return;
+  }
+
+  Serial.println("Firmware download completed: 100%");
+
+  if (Update.end()) {
+    Serial.println("OTA UPDATE SUCCESS!");
+    Serial.println("Restarting ESP32...");
+
+    blinkLED(3);
+    ESP.restart();
+
   } else {
-    Serial.print("Failed to download firmware. Status code: ");
-    Serial.println(statusCode);
+    Serial.print("OTA FINALIZATION ERROR: ");
+    Serial.println(Update.getError());
+
+    Update.abort();
+    blinkLED(1);
   }
 }
+
 
 /**********************************************  SD-Card Functions ***************************************************/
 // Function to check if SD card is present and accessible
