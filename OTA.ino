@@ -59,9 +59,9 @@ const char *filePath = "/CCMS/Meter_Readings.txt";
 SPIClass spi2(HSPI);  //SD Card
 
 /*Version URL*/
-const char *version_url = "https://raw.githubusercontent.com/NandeepYadav/OTA_Repo/master/version.txt";
+const char *version_url = "https://raw.githubusercontent.com/Mahesh-rss/OTA_Repo/main/version.txt";
 /*Firmware URL*/
-const char *firmware_url = "https://raw.githubusercontent.com/NandeepYadav/OTA_Repo/master/OTA.ino.bin";
+const char *firmware_url = "https://raw.githubusercontent.com/Mahesh-rss/OTA_Repo/main/OTA.ino.bin";
 const char *server = "124.40.247.18";              // Your Spring Boot server
 const char *versionResource = "/dblayer/version";  // Version check endpoint
 const char *firmwareResource = "/dblayer/ota";     // Firmware update endpoint
@@ -168,6 +168,9 @@ Preferences preferences;
 #define TINY_GSM_MODEM_BG96  //worked for Quectel EC200
 #define SerialAT Serial1
 #define TINY_GSM_USE_GPRS true
+// Quectel AT+QIRD accepts up to 1500 bytes. TinyGSM's default of 64
+// turns a 1 MB firmware download into one AT command per 63 bytes.
+#define TINY_GSM_RX_BUFFER 1500
 
 
 #include <TinyGsmClient.h>  //https://github.com/vshymanskyy/TinyGSM
@@ -204,6 +207,9 @@ TinyGsm modem(SerialAT);  //controls and communicates with the ec200
 TinyGsmClient client(modem);  // used to create connection
 PubSubClient mqtt(client);    //
 HttpClient http(client, server, port);
+
+// Baud the EC200 is actually using. OTA leaves this at 460800 across ESP.restart().
+uint32_t modemBaud = 115200;
 
 String readBuffer;
 String doorStatus = "Open";
@@ -304,7 +310,9 @@ void setup() {
   delay(3000);
 
   // Initialize Serial Communication
-  Serial.begin(115200);                            //Default Serial Monitor
+  Serial.begin(115200);  //Default Serial Monitor
+  // Hold a full QIRD payload if the modem UART bursts faster than the read loop.
+  SerialAT.setRxBufferSize(4096);
   SerialAT.begin(115200, SERIAL_8N1, RXD1, TXD1);  //Serial 1 for 4G
   // Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);     //Serial 2 for RS485 / RS232
   Serial0.begin(9600);  // Data Acquisition of Analog/Digital Channels
@@ -706,17 +714,155 @@ void checkGPRS() {
   }
 }
 
+bool waitForModemOK(uint32_t timeoutMs) {
+  String resp;
+  unsigned long start = millis();
+
+  while (millis() - start < timeoutMs) {
+    while (SerialAT.available()) {
+      resp += (char)SerialAT.read();
+      if (resp.indexOf("OK") >= 0) return true;
+      if (resp.indexOf("ERROR") >= 0) return false;
+    }
+    delay(10);
+  }
+
+  return false;
+}
+
+bool probeModem(uint32_t timeoutMs) {
+  while (SerialAT.available()) SerialAT.read();
+  SerialAT.println("AT");
+  return waitForModemOK(timeoutMs);
+}
+
+// Faster UART so firmware bytes are not limited by 115200 after each QIRD.
+bool raiseModemBaud(uint32_t baud) {
+  if (modemBaud == baud) {
+    Serial.print("Modem UART already ");
+    Serial.println(baud);
+    return true;
+  }
+
+  while (SerialAT.available()) SerialAT.read();
+
+  SerialAT.print("AT+IPR=");
+  SerialAT.println(baud);
+  // Quectel sends OK at the new rate, so switch before reading it.
+  delay(300);
+  SerialAT.updateBaudRate(baud);
+  modemBaud = baud;
+  delay(200);
+  while (SerialAT.available()) SerialAT.read();
+
+  if (probeModem(1000)) {
+    Serial.print("Modem UART set to ");
+    Serial.println(baud);
+    return true;
+  }
+
+  SerialAT.updateBaudRate(115200);
+  modemBaud = 115200;
+  delay(200);
+  while (SerialAT.available()) SerialAT.read();
+  probeModem(1000);
+  Serial.println("Modem UART stayed at 115200");
+  return false;
+}
+
+// The modem keeps AT+IPR across an ESP restart. Talk to it at the rate it is
+// already using so modem.init() can see the network.
+void alignModemBaud() {
+  SerialAT.updateBaudRate(115200);
+  modemBaud = 115200;
+  if (probeModem(800)) {
+    Serial.println("Modem UART is 115200");
+    return;
+  }
+
+  SerialAT.updateBaudRate(460800);
+  delay(200);
+  modemBaud = 460800;
+  if (probeModem(800)) {
+    Serial.println("Modem UART is 460800");
+    return;
+  }
+
+  SerialAT.updateBaudRate(115200);
+  modemBaud = 115200;
+  delay(200);
+  while (SerialAT.available()) SerialAT.read();
+  Serial.println("Modem not answering. Keeping UART at 115200");
+}
+
+// The next sketch opens the modem UART at 115200. Leave the EC200 there,
+// and do not restart until it answers at that rate.
+void restartController() {
+  client.stop();
+  delay(200);
+
+  if (!probeModem(1000)) {
+    uint32_t other = (modemBaud == 460800) ? 115200 : 460800;
+    SerialAT.updateBaudRate(other);
+    modemBaud = other;
+    delay(200);
+    probeModem(1000);
+  }
+
+  if (modemBaud != 115200) {
+    while (SerialAT.available()) SerialAT.read();
+    SerialAT.println("AT+IPR=115200");
+    delay(300);
+    SerialAT.updateBaudRate(115200);
+    modemBaud = 115200;
+    delay(200);
+  }
+
+  bool restored = false;
+  for (int attempt = 0; attempt < 5; attempt++) {
+    if (probeModem(500)) {
+      restored = true;
+      break;
+    }
+    delay(200);
+  }
+
+  if (restored) {
+    Serial.println("Modem UART set to 115200 before restart");
+  } else {
+    Serial.println("Could not confirm 115200 before restart");
+  }
+  Serial.flush();
+  delay(100);
+  ESP.restart();
+}
+
 void check4Gmodule() {
   Serial.println("\nconfiguring 4G Module. Kindly wait");
   delay(5000);
+  Serial.println(apn);
+  alignModemBaud();
 
   // Restart takes quite some time
   // To skip it, call init() instead of restart()
   DBG("Initializing modem...");
   if (!modem.init()) {
-    DBG("Failed to restart modem");
-    return;
+    uint32_t other = (modemBaud == 115200) ? 460800 : 115200;
+    Serial.print("Modem init failed at ");
+    Serial.print(modemBaud);
+    Serial.print(". Retrying at ");
+    Serial.println(other);
+    SerialAT.updateBaudRate(other);
+    modemBaud = other;
+    delay(200);
+    while (SerialAT.available()) SerialAT.read();
+    if (!modem.init()) {
+      Serial.println("Failed to init modem. No network");
+      return;
+    }
   }
+
+  raiseModemBaud(115200);
   // Restart takes quite some time
   // To skip it, call init() instead of restart()
 
@@ -736,6 +882,7 @@ void check4Gmodule() {
   delay(15000);
   if (modem.isNetworkConnected()) {
     Serial.println("Connected to Network");
+    Serial.println(apn);
   } else
     Serial.println("No Network");
 
@@ -761,8 +908,8 @@ void check4Gmodule() {
     // Check version if modem is connected
     checkVersion();
     setRTCFromString(getDateTime());
-    // fetchMqttCreds();
-    setMqttCredsHost();
+    fetchMqttCreds();
+    //setMqttCredsHost();
     // fetchDeviceType();
   } else {
     Serial.println("No LTE Internet");
@@ -1044,7 +1191,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int len) {
     publishStatus();
   } else if (message.equals("RESET_CONTROLLER")) {
     Serial.println("Restarting the MicroController...");
-    ESP.restart();
+    restartController();
   } else if (message.equals("ENABLE_THRESHOLD_CHECK")) {
     writeThresholdCheckStateIntoEEPROM(message);
   } else if (message.equals("DISABLE_THRESHOLD_CHECK")) {
@@ -1346,7 +1493,7 @@ void readAndPublishParams() {
     // docu["dateTime"] = dateTime = globalDateTime = getDateTime();
     // docu["dateTime"] = dateTime = globalDateTime = getRTCTimestamp();
     docu["dateTime"] = dateTime = globalDateTime = getCurrentTime();
-    Serial.println("Date <^.^> time to publish is : ");
+    Serial.println("Date time to publish is : ");
     Serial.println(dateTime.c_str());
     const char *dt = dateTime.c_str();
     // docu["Door_Status"] = getDoorState();
@@ -2780,7 +2927,7 @@ void performOTA() {
 
       if (written == contentLength && Update.end()) {
         Serial.println("OTA Update Success. Restarting...");
-        ESP.restart();
+        restartController();
       } else {
         Serial.println("OTA Update Failed. Error #: " + String(Update.getError()));
       }
@@ -2917,6 +3064,24 @@ long getOTAContentLength(String headers) {
   return value.toInt();
 }
 
+long otaRangeStart(const String &headers) {
+  String range = getOTAHeader(headers, "Content-Range");
+  int marker = range.indexOf("bytes");
+  if (marker < 0) return -1;
+
+  int startPos = range.indexOf(' ', marker);
+  if (startPos < 0) return -1;
+
+  int dash = range.indexOf('-', startPos);
+  if (dash < 0) return -1;
+
+  String startText = range.substring(startPos + 1, dash);
+  startText.trim();
+  if (startText.length() == 0) return -1;
+
+  return startText.toInt();
+}
+
 // Perform OTA update
 
 void performUpdate() {
@@ -2938,11 +3103,13 @@ void performUpdate() {
   String auth = "max24:max24";
   String encodedAuth = base64::encode(auth);
 
-  const size_t bufferSize = 1024;
+  const size_t bufferSize = 1460;
   uint8_t buffer[bufferSize];
 
   size_t written = 0;
   size_t totalLength = 0;
+  int lastLoggedProgress = -1;
+  unsigned long downloadStartedAt = millis();
 
   bool updateStarted = false;
 
@@ -2970,6 +3137,7 @@ void performUpdate() {
 
     Serial.print("Connecting to OTA server. Resume position: ");
     Serial.println(written);
+    size_t writtenBefore = written;
 
     if (!client.connect(server, port)) {
       Serial.println("TCP connection failed.");
@@ -3020,90 +3188,75 @@ void performUpdate() {
     Serial.print("HTTP response: ");
     Serial.println(statusLine);
 
+    size_t skipRemaining = 0;
+    bool responseOk = false;
+
     if (!updateStarted) {
 
-      if (statusLine.indexOf(" 200 ") < 0 || responseLength <= 0) {
-        Serial.println("Invalid initial HTTP response.");
-        client.stop();
-        retries++;
-        delay(2000);
-        continue;
+      if (statusLine.indexOf(" 200 ") >= 0 && responseLength > 0) {
+        totalLength = responseLength;
+
+        Serial.print("Firmware size: ");
+        Serial.println(totalLength);
+
+        if (!Update.begin(totalLength)) {
+          Serial.print("Update begin failed: ");
+          Serial.println(Update.getError());
+
+          client.stop();
+          blinkLED(1);
+          return;
+        }
+
+        updateStarted = true;
+        responseOk = true;
+        Serial.println("OTA partition initialized.");
       }
 
-      totalLength = responseLength;
+    } else if (statusLine.indexOf(" 206 ") >= 0 && responseLength == (long)(totalLength - written) && otaRangeStart(headers) == (long)written) {
 
-      Serial.print("Firmware size: ");
-      Serial.println(totalLength);
-
-      if (!Update.begin(totalLength)) {
-        Serial.print("Update begin failed: ");
-        Serial.println(Update.getError());
-
-        client.stop();
-        blinkLED(1);
-        return;
-      }
-
-      updateStarted = true;
-      Serial.println("OTA partition initialized.");
-
-    } else if (written == 0) {
-
-      if (statusLine.indexOf(" 200 ") < 0 || responseLength != (long)totalLength) {
-        Serial.println("Invalid initial retry response.");
-        client.stop();
-        retries++;
-        delay(2000);
-        continue;
-      }
-
-    } else {
-
-      String contentRange =
-        getOTAHeader(headers, "Content-Range");
-
-      String expectedRange =
-        "bytes " + String(written) + "-" + String(totalLength - 1) + "/" + String(totalLength);
-
-      if (statusLine.indexOf(" 206 ") < 0 || contentRange != expectedRange || responseLength != (long)(totalLength - written)) {
-
-        Serial.println("Invalid partial HTTP response.");
-
-        Serial.print("Received Content-Range: ");
-        Serial.println(contentRange);
-
-        Serial.print("Expected Content-Range: ");
-        Serial.println(expectedRange);
-
-        client.stop();
-        retries++;
-        delay(2000);
-        continue;
-      }
-
+      responseOk = true;
       Serial.println("Resume response verified.");
+
+    } else if (statusLine.indexOf(" 200 ") >= 0 && responseLength == (long)totalLength) {
+
+      // Server ignored Range and sent the whole image again.
+      skipRemaining = written;
+      responseOk = true;
+      Serial.println("Server sent the full file. Skipping bytes already written.");
     }
 
+    if (!responseOk) {
+      Serial.println("Unexpected HTTP response. Retrying.");
+      client.stop();
+      retries++;
+      delay(2000);
+      continue;
+    }
+
+    size_t skipAtStart = skipRemaining;
     unsigned long dataTimer = millis();
 
     while (written < totalLength) {
 
-      int availableBytes = client.available();
+      size_t toRead = min(bufferSize, totalLength - written + skipRemaining);
+      int bytesRead = client.read(buffer, toRead);
 
-      if (availableBytes > 0) {
+      if (bytesRead > 0) {
+        int offset = 0;
+        int usable = bytesRead;
 
-        size_t toRead = min(
-          (size_t)availableBytes,
-          min(bufferSize, totalLength - written));
+        if (skipRemaining > 0) {
+          size_t skipNow = min(skipRemaining, (size_t)bytesRead);
+          skipRemaining -= skipNow;
+          offset = skipNow;
+          usable = bytesRead - (int)skipNow;
+        }
 
-        int bytesRead = client.read(buffer, toRead);
+        if (usable > 0) {
+          size_t bytesWritten = Update.write(buffer + offset, usable);
 
-        if (bytesRead > 0) {
-
-          size_t bytesWritten =
-            Update.write(buffer, bytesRead);
-
-          if (bytesWritten != (size_t)bytesRead) {
+          if (bytesWritten != (size_t)usable) {
             Serial.println("Firmware flash write failed.");
 
             Serial.print("Update error: ");
@@ -3116,15 +3269,22 @@ void performUpdate() {
           }
 
           written += bytesWritten;
-          dataTimer = millis();
+        }
 
-          int progress = (written * 100) / totalLength;
+        dataTimer = millis();
+
+        int progress = (written * 100) / totalLength;
+        if (progress != lastLoggedProgress) {
+          lastLoggedProgress = progress;
+          unsigned long elapsed = millis() - downloadStartedAt;
+          float kbps = elapsed > 0 ? (written / 1024.0f) / (elapsed / 1000.0f) : 0;
 
           Serial.printf(
-            "OTA Progress: %d%% (%u/%u bytes)\n",
+            "OTA Progress: %d%% (%u/%u bytes, %.1f KB/s)\n",
             progress,
             (unsigned int)written,
-            (unsigned int)totalLength);
+            (unsigned int)totalLength,
+            kbps);
         }
 
       } else {
@@ -3134,7 +3294,7 @@ void performUpdate() {
           break;
         }
 
-        if (millis() - dataTimer > 60000) {
+        if (millis() - dataTimer > 20000) {
           Serial.println("Download stalled. Resume required.");
           break;
         }
@@ -3146,12 +3306,18 @@ void performUpdate() {
     client.stop();
 
     if (written < totalLength) {
-      retries++;
+      size_t consumed = (written - writtenBefore) + (skipAtStart - skipRemaining);
 
-      Serial.print("Reconnect attempt: ");
-      Serial.print(retries);
-      Serial.print("/");
-      Serial.println(maxRetries);
+      if (consumed == 0) {
+        retries++;
+        Serial.print("Reconnect attempt: ");
+        Serial.print(retries);
+        Serial.print("/");
+        Serial.println(maxRetries);
+      } else {
+        retries = 0;
+        Serial.println("Link dropped after progress. Resuming.");
+      }
 
       delay(2000);
     }
@@ -3182,7 +3348,7 @@ void performUpdate() {
     Serial.println("Restarting ESP32...");
 
     blinkLED(3);
-    ESP.restart();
+    restartController();
 
   } else {
     Serial.print("OTA FINALIZATION ERROR: ");
@@ -3192,6 +3358,7 @@ void performUpdate() {
     blinkLED(1);
   }
 }
+
 
 
 /**********************************************  SD-Card Functions ***************************************************/
@@ -3738,9 +3905,35 @@ String decryptString(const String &encryptedText, const byte *key, const byte *i
 
 void enableGPS() {
   Serial.println("Enabling GPS module...");
+
+  while (SerialAT.available()) SerialAT.read();
+  SerialAT.println("AT+QGPS?");
+  gpsData = "";
+  unsigned long start = millis();
+  bool done = false;
+  while (millis() - start < 2000 && !done) {
+    while (SerialAT.available()) {
+      gpsData += (char)SerialAT.read();
+      if (gpsData.indexOf("OK") >= 0 || gpsData.indexOf("ERROR") >= 0) {
+        done = true;
+        break;
+      }
+    }
+    delay(10);
+  }
+
+  if (gpsData.indexOf("+QGPS: 1") >= 0) {
+    Serial.println("Already enabled");
+    return;
+  }
+
   SerialAT.println("AT+QGPS=1");
   delay(2000);
   gpsData = SerialAT.readString();
+  if (gpsData.indexOf("ERROR") >= 0) {
+    Serial.println("Already enabled");
+    return;
+  }
   Serial.print("GPS Enable Response: ");
   Serial.println(gpsData);
 }
