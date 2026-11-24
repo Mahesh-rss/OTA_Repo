@@ -1493,7 +1493,7 @@ void readAndPublishParams() {
     // docu["dateTime"] = dateTime = globalDateTime = getDateTime();
     // docu["dateTime"] = dateTime = globalDateTime = getRTCTimestamp();
     docu["dateTime"] = dateTime = globalDateTime = getCurrentTime();
-    Serial.println("Date time to publish is : ");
+    Serial.println("Date <^.^> time to publish is : ");
     Serial.println(dateTime.c_str());
     const char *dt = dateTime.c_str();
     // docu["Door_Status"] = getDoorState();
